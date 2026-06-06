@@ -93,10 +93,27 @@ class TestFingerprintVersioning(unittest.TestCase):
         d2 = self.fp.generate(exc2, (_frame(),))
         self.assertEqual(d1.value, d2.value)
 
-    def test_path_normalized_cross_platform(self):
-        frame_unix = _frame("/home/user/app/main.py")
-        frame_windows = FrameInfo(
-            filename="C:\\Users\\user\\app\\main.py",
+    def test_frames_use_module_key(self):
+        """Frames usam 'module' (estável entre máquinas) em vez de 'filename'."""
+        frame = _frame("app/main.py")
+        exc = _exc_info()
+        details = self.fp.generate(exc, (frame,))
+        for frame_data in details.canonical["frames"]:
+            self.assertIn("module", frame_data)
+            self.assertNotIn("filename", frame_data)
+
+    def test_same_module_different_absolute_paths_same_fingerprint(self):
+        """Caminhos absolutos distintos com mesmo módulo geram a mesma fingerprint."""
+        frame_user1 = FrameInfo(
+            filename="/home/user1/project/src/app.py",
+            function="process",
+            line_number=42,
+            module="app.main",
+            locals={},
+            source_line=None,
+        )
+        frame_user2 = FrameInfo(
+            filename="/home/user2/project/src/app.py",
             function="process",
             line_number=42,
             module="app.main",
@@ -104,14 +121,32 @@ class TestFingerprintVersioning(unittest.TestCase):
             source_line=None,
         )
         exc = _exc_info()
-        d_unix = self.fp.generate(exc, (frame_unix,))
-        d_win = self.fp.generate(exc, (frame_windows,))
-        # Ambos normalizam para "home/user/app/main.py" vs "Users/user/app/main.py"
-        # O que importa é que não contêm âncoras absolutas
-        for frame_data in d_unix.canonical["frames"]:
-            self.assertFalse(frame_data["filename"].startswith("/"))
-        for frame_data in d_win.canonical["frames"]:
-            self.assertFalse(frame_data["filename"].startswith("C:"))
+        d1 = self.fp.generate(exc, (frame_user1,))
+        d2 = self.fp.generate(exc, (frame_user2,))
+        self.assertEqual(d1.value, d2.value)
+
+    def test_different_modules_different_fingerprints(self):
+        """Módulos distintos ainda produzem fingerprints distintas."""
+        frame_a = FrameInfo(
+            filename="/home/user/project/app_a.py",
+            function="handle",
+            line_number=10,
+            module="app.service_a",
+            locals={},
+            source_line=None,
+        )
+        frame_b = FrameInfo(
+            filename="/home/user/project/app_b.py",
+            function="handle",
+            line_number=10,
+            module="app.service_b",
+            locals={},
+            source_line=None,
+        )
+        exc = _exc_info()
+        d1 = self.fp.generate(exc, (frame_a,))
+        d2 = self.fp.generate(exc, (frame_b,))
+        self.assertNotEqual(d1.value, d2.value)
 
     def test_fingerprint_value_length(self):
         details = self.fp.generate(_exc_info(), (_frame(),))

@@ -29,3 +29,7 @@ class InvalidPackageError(StorageError):
 
 class ReplayError(TraceSeedError, RuntimeError):
     """Falha ao inspecionar ou executar um replay."""
+
+
+class CallbackError(TraceSeedError):
+    """Falha no callback on_captured em modo strict=True."""

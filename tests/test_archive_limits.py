@@ -70,6 +70,7 @@ class TestArchiveLimits(unittest.TestCase):
             max_archive_file_size=1024,
             max_archive_total_size=4096,
             max_compression_ratio=10000,  # alto para não disparar antes do total
+            max_manifest_size=512,  # deve ser <= max_archive_file_size
         )
         stor = ArchiveStorage(cfg, SafeSerializer(cfg))
         entries = {f"file_{i}.json": b"x" * 500 for i in range(10)}

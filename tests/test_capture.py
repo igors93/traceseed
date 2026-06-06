@@ -341,7 +341,8 @@ class CaptureTests(unittest.TestCase):
             fail("x")
         self.assertFalse(storage.records[0].callable_info.replayable)
 
-    def test_replay_payload_redacts_nested_sensitive_values(self):
+    def test_replay_disabled_when_args_redacted(self):
+        """Quando argumentos são redigidos, replay.json declara replayable=False."""
         storage = MemoryStorage()
         try:
             raise RuntimeError("x")
@@ -355,9 +356,11 @@ class CaptureTests(unittest.TestCase):
                 replay_keyword_arguments={},
                 storage=storage,
             )
-        payload = str(storage.extras[0]["replay"])
-        self.assertNotIn("secret", payload)
-        self.assertIn("[REDACTED]", payload)
+        replay = storage.extras[0]["replay"]
+        # Segredo nunca aparece no payload
+        self.assertNotIn("secret", str(replay))
+        # Replay é marcado como não reproduzível (arg foi redigido)
+        self.assertFalse(replay["replayable"])
 
     def test_registered_codec_enables_replay_serialization(self):
         class Box:

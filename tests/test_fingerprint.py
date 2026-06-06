@@ -47,10 +47,13 @@ class FingerprintTests(unittest.TestCase):
         two = self.fp.generate(self.info("bad"), (other,))
         self.assertNotEqual(one.value, two.value)
 
-    def test_path_is_shortened(self):
+    def test_frame_uses_module_not_filename(self):
         details = self.fp.generate(self.info("bad"), (self.frame,))
-        filename = details.canonical["frames"][0]["filename"]
-        self.assertFalse(filename.startswith("/"))
+        frame_data = details.canonical["frames"][0]
+        # Novo formato: usa "module" (estável entre máquinas)
+        self.assertIn("module", frame_data)
+        self.assertNotIn("filename", frame_data)
+        self.assertEqual(frame_data["module"], "app.service")
 
     def test_normalization_can_be_disabled(self):
         fp = Fingerprinter(TraceSeedConfig(normalize_exception_messages=False))

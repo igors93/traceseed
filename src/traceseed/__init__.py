@@ -29,6 +29,7 @@ from .context import (
     set_context,
 )
 from .errors import (
+    CallbackError,
     ConfigurationError,
     IntegrityError,
     InvalidPackageError,
@@ -66,6 +67,7 @@ __all__ = [
     "unregister_collector",
     # errors
     "TraceSeedError",
+    "CallbackError",
     "ConfigurationError",
     "IntegrityError",
     "InvalidPackageError",

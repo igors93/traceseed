@@ -67,6 +67,8 @@ class CaptureContext:
     metadata: dict[str, Any] = field(default_factory=dict)
     arguments: dict[str, Any] = field(default_factory=dict)
     callable_info: CallableInfo | None = None
+    # Argumentos brutos de replay — ficam somente em memória durante a captura;
+    # nunca persistidos diretamente em FailureRecord.
     replay_arguments: tuple[Any, ...] | None = None
     replay_keyword_arguments: dict[str, Any] | None = None
 
@@ -86,8 +88,6 @@ class FailureRecord:
     collector_errors: tuple[dict[str, str], ...] = ()
     extensions: dict[str, Any] = field(default_factory=dict)
     callable_info: CallableInfo | None = None
-    replay_arguments: tuple[Any, ...] | None = None
-    replay_keyword_arguments: dict[str, Any] | None = None
     format_version: int = 1
     library_version: str = "0.1.0"
 

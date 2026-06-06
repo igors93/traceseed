@@ -53,6 +53,8 @@ class TraceSeedConfig:
     filename_prefix: str = "failure"
     normalize_exception_messages: bool = True
     capture_locals: bool = False
+    capture_argv: bool = False
+    capture_cwd: bool = True
     re_raise: bool = True
     include_package_hashes: bool = True
     write_pretty_json: bool = True
@@ -62,6 +64,12 @@ class TraceSeedConfig:
     max_archive_total_size: int = 200 * 1024 * 1024  # 200 MB total descompactado
     max_compression_ratio: int = 200  # razão suspeita de compressão
     max_manifest_size: int = 512 * 1024  # 512 KB para manifest.json
+    # Limites de profundidade e tamanho para segurança de captura
+    max_exception_depth: int = 20
+    max_exception_children: int = 32
+    max_operation_length: int = 256
+    max_traceback_text_length: int = 100_000
+    max_replay_payload_size: int = 1_000_000  # 1 MB
 
     def __post_init__(self) -> None:
         if isinstance(self.output_directory, str):
@@ -91,6 +99,30 @@ class TraceSeedConfig:
             raise ConfigurationError("fingerprint_frame_limit deve ser >= 1")
         if not self.filename_prefix.strip():
             raise ConfigurationError("filename_prefix não pode ser vazio ou só espaços")
+        if self.max_archive_files < 1:
+            raise ConfigurationError("max_archive_files deve ser >= 1")
+        if self.max_archive_file_size < 1:
+            raise ConfigurationError("max_archive_file_size deve ser >= 1")
+        if self.max_archive_total_size < 1:
+            raise ConfigurationError("max_archive_total_size deve ser >= 1")
+        if self.max_archive_total_size < self.max_archive_file_size:
+            raise ConfigurationError("max_archive_total_size deve ser >= max_archive_file_size")
+        if self.max_compression_ratio < 1:
+            raise ConfigurationError("max_compression_ratio deve ser >= 1")
+        if self.max_manifest_size < 1:
+            raise ConfigurationError("max_manifest_size deve ser >= 1")
+        if self.max_manifest_size > self.max_archive_file_size:
+            raise ConfigurationError("max_manifest_size deve ser <= max_archive_file_size")
+        if self.max_exception_depth < 1:
+            raise ConfigurationError("max_exception_depth deve ser >= 1")
+        if self.max_exception_children < 0:
+            raise ConfigurationError("max_exception_children deve ser >= 0")
+        if self.max_operation_length < 8:
+            raise ConfigurationError("max_operation_length deve ser >= 8")
+        if self.max_traceback_text_length < 100:
+            raise ConfigurationError("max_traceback_text_length deve ser >= 100")
+        if self.max_replay_payload_size < 100:
+            raise ConfigurationError("max_replay_payload_size deve ser >= 100")
 
     def with_overrides(self, **kwargs: Any) -> TraceSeedConfig:
         fields = {f.name: getattr(self, f.name) for f in self.__dataclass_fields__.values()}

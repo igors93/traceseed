@@ -7,7 +7,7 @@
 3. Dados sensíveis são removidos antes da persistência.
 4. Componentes de coleta, serialização e armazenamento podem ser substituídos.
 5. O formato `.tseed` é verificável e versionado.
-6. A biblioteca padrão do Python é suficiente em runtime e nos testes.
+6. O formato `.tseed` é auditável: hashes detectam corrupção acidental (não autenticam origem).
 
 ## Fluxo
 

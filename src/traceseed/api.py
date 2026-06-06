@@ -4,7 +4,13 @@ Semântica de strict:
   strict=False (padrão): falhas internas de captura não substituem a exceção
     original; o erro vai para stderr; re_raise continua funcionando normalmente.
   strict=True: falhas internas levantam StorageError (com exceção original como
-    __cause__); o comportamento é igual nos quatro contextos de captura.
+    __cause__); falha de callback levanta CallbackError; o comportamento é igual
+    nos quatro contextos de captura.
+
+asyncio hooks:
+  install_asyncio() é idempotente por loop: instalar duas vezes não empilha
+  wrappers. Usa WeakKeyDictionary para evitar retenção de loops e colisão
+  de id() após garbage collection.
 """
 
 from __future__ import annotations
@@ -14,6 +20,7 @@ import functools
 import inspect
 import sys
 import threading
+import weakref
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
 from inspect import BoundArguments
@@ -22,7 +29,7 @@ from typing import Any, TypeVar
 from .collectors import CollectorRegistry
 from .config import TraceSeedConfig, get_config
 from .engine import CaptureEngine
-from .errors import StorageError
+from .errors import CallbackError, StorageError
 from .models import CallableInfo, CaptureContext, CaptureResult
 from .serialization import SafeSerializer
 from .storage.archive import ArchiveStorage
@@ -36,8 +43,12 @@ _old_excepthook: Any = None
 _old_thread_excepthook: Any = None
 _last_capture: CaptureResult | None = None
 
-# install_asyncio state: maps loop id -> old handler
-_asyncio_handlers: dict[int, Any] = {}
+# Asyncio: WeakKeyDictionary usa a referência real do loop como chave.
+# Quando o loop é coletado pelo GC, a entrada some automaticamente.
+# Isso evita colisões de id() entre loops destruídos e novos.
+_asyncio_handlers: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any] = (
+    weakref.WeakKeyDictionary()
+)
 
 _SKIP_TYPES = (KeyboardInterrupt, SystemExit)
 
@@ -74,6 +85,23 @@ def _bind_arguments(func: Callable[..., Any], args: tuple, kwargs: dict) -> dict
 def _raise_strict(storage_error_msg: str, original: BaseException) -> None:
     """Levanta StorageError preservando a exceção original como __cause__."""
     raise StorageError(storage_error_msg) from original
+
+
+def _invoke_callback(
+    on_captured: Callable[[CaptureResult], Any],
+    result: CaptureResult,
+    strict: bool,
+    original: BaseException,
+) -> None:
+    """Invoca on_captured respeitando strict."""
+    if strict:
+        try:
+            on_captured(result)
+        except Exception as cb_err:
+            raise CallbackError(str(cb_err)) from original
+    else:
+        with suppress(Exception):
+            on_captured(result)
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +157,7 @@ def capture_exception(
     _last_capture = result
 
     if on_captured is not None:
-        with suppress(Exception):
-            on_captured(result)
+        _invoke_callback(on_captured, result, strict, exception)
 
     return result
 
@@ -255,8 +282,7 @@ def _capture_in_wrapper(
     global _last_capture
     _last_capture = result
     if on_captured:
-        with suppress(Exception):
-            on_captured(result)
+        _invoke_callback(on_captured, result, strict, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +319,7 @@ def guard(
             global _last_capture
             _last_capture = result
             if on_captured:
-                with suppress(Exception):
-                    on_captured(result)
+                _invoke_callback(on_captured, result, strict, exc)
 
         if cfg.re_raise:
             raise
@@ -370,6 +395,9 @@ def install_asyncio(
 ) -> asyncio.AbstractEventLoop:
     """Instala handler de exceções no loop asyncio, preservando o handler anterior.
 
+    É idempotente por loop: instalar duas vezes não empilha wrappers.
+    Usa WeakKeyDictionary para evitar retenção do loop e colisão de id().
+
     Retorna o loop configurado (útil para chamar uninstall_asyncio depois).
     """
     cfg = config
@@ -380,9 +408,12 @@ def install_asyncio(
     except RuntimeError:
         lp = asyncio.new_event_loop()
 
+    # Idempotência: se já instalado neste loop, retorna sem re-instalar
+    if lp in _asyncio_handlers:
+        return lp
+
     old_handler = lp.get_exception_handler()
-    loop_id = id(lp)
-    _asyncio_handlers[loop_id] = old_handler
+    _asyncio_handlers[lp] = old_handler
 
     def _asyncio_handler(lp2: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
         exc = context.get("exception")
@@ -402,15 +433,19 @@ def install_asyncio(
 
 
 def uninstall_asyncio(loop: asyncio.AbstractEventLoop | None = None) -> None:
-    """Restaura o handler asyncio anterior ao install_asyncio()."""
+    """Restaura o handler asyncio anterior ao install_asyncio().
+
+    É seguro chamar mais de uma vez (idempotente).
+    """
     try:
         lp = loop or asyncio.get_event_loop()
     except RuntimeError:
         return
 
-    loop_id = id(lp)
-    if loop_id in _asyncio_handlers:
-        lp.set_exception_handler(_asyncio_handlers.pop(loop_id))
+    if lp not in _asyncio_handlers:
+        return
+
+    lp.set_exception_handler(_asyncio_handlers.pop(lp))
 
 
 # ---------------------------------------------------------------------------

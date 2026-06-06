@@ -20,7 +20,7 @@ TraceSeed é uma biblioteca modular com **zero dependências em runtime**. Ela c
 - Coletores e serializers extensíveis.
 - CLI para visualizar, verificar, listar, comparar e reproduzir.
 - Hooks para `sys`, `threading` e `asyncio`.
-- 145 testes feitos somente com `unittest`.
+- Mais de 200 testes de regressão, lint e tipagem estática.
 
 ## Requisitos
 
@@ -43,27 +43,13 @@ $env:PYTHONPATH = "src"
 python examples/basic.py
 ```
 
-## Instalação local sem baixar dependências
-
-O instalador incluído usa somente a biblioteca padrão:
-
-```bash
-python install_local.py
-```
-
-Para remover:
-
-```bash
-python uninstall_local.py
-```
-
-Também é possível instalar com ferramentas de build Python comuns:
+## Instalação
 
 ```bash
 python -m pip install .
 ```
 
-A biblioteca não declara dependências de runtime. Esse método pode usar o backend de build configurado no `pyproject.toml`.
+A biblioteca não declara dependências de runtime.
 
 ## Primeiro exemplo
 
@@ -240,19 +226,18 @@ Sem instalação:
 PYTHONPATH=src python -m traceseed show error.tseed
 ```
 
-## Testes
+## Desenvolvimento
+
+TraceSeed possui **zero dependências em runtime**. Para desenvolvimento, testes, lint e tipagem, o projeto utiliza pytest, Ruff e mypy.
 
 ```bash
-python run_tests.py
+python -m ruff format --check .
+python -m ruff check .
+python -m mypy src
+python -m pytest
 ```
 
-Ou:
-
-```bash
-PYTHONPATH=src:. python -m unittest discover -s tests -v
-```
-
-A suíte cobre 145 cenários, incluindo corrupção de pacotes, dados circulares, `repr()` defeituoso, concorrência assíncrona, hooks globais, falhas dos coletores e reprodução.
+A suíte cobre mais de 200 cenários, incluindo corrupção de pacotes, proteção contra ZIP bomb, ciclos em exceções, `repr()` defeituoso, concorrência assíncrona, hooks globais, falhas dos coletores e reprodução.
 
 ## Estrutura
 
