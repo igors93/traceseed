@@ -1,7 +1,8 @@
-"""Segurança do replay: argumentos brutos nunca persistidos, replay desabilitado quando redigido."""
+"""Validate replay redaction, integrity, and explicit execution policy."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -9,15 +10,21 @@ import zipfile
 from pathlib import Path
 
 from traceseed import TraceSeedConfig, capture_exception
-from traceseed.errors import ReplayError
+from traceseed.errors import ConfigurationError, InvalidPackageError, ReplayError
 from traceseed.models import CallableInfo
 from traceseed.replay import ReplayRunner
 from traceseed.serialization import SafeSerializer
 from traceseed.storage import ArchiveStorage, MemoryStorage
 
 
+def _archive_payload_bytes(path: str | Path) -> bytes:
+    """Return decompressed bytes for every member in a package."""
+    with zipfile.ZipFile(path) as archive:
+        return b"\n".join(archive.read(name) for name in archive.namelist())
+
+
 class TestReplayArgsSecurity(unittest.TestCase):
-    """Argumentos brutos de replay nunca aparecem em nenhum arquivo do .tseed."""
+    """Replay arguments must be sanitized before persistence."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -27,207 +34,184 @@ class TestReplayArgsSecurity(unittest.TestCase):
 
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _capture_with_secret(self, secret: str) -> str:
-        """Captura uma exceção com um segredo em argumento posicional."""
-        cfg = TraceSeedConfig(output_directory=Path(self.tmp))
-        stor = ArchiveStorage(cfg, SafeSerializer(cfg))
-        try:
-            raise RuntimeError("test error")
-        except RuntimeError as exc:
-            result = capture_exception(
-                exc,
-                callable_info=CallableInfo("tests.replay_targets", "add", True),
-                replay_arguments=(secret, 2),
-                replay_keyword_arguments={},
-                config=cfg,
-                storage=stor,
-                strict=True,
-            )
-        return result.location  # type: ignore[return-value]
-
-    def test_password_in_positional_arg_not_in_zip_bytes(self):
+    def test_password_in_positional_arg_not_in_package_payloads(self):
         secret = "super-secret-password-replay-12345"
-        # Add to redact_fields via default pattern approach — use a sensitive key name
-        cfg = TraceSeedConfig(output_directory=Path(self.tmp))
-        stor = ArchiveStorage(cfg, SafeSerializer(cfg))
+        config = TraceSeedConfig(output_directory=Path(self.tmp))
+        storage = ArchiveStorage(config, SafeSerializer(config))
+
         try:
             raise RuntimeError("test")
-        except RuntimeError as exc:
+        except RuntimeError as error:
             result = capture_exception(
-                exc,
+                error,
                 callable_info=CallableInfo("tests.replay_targets", "add", True),
                 replay_arguments=({"password": secret},),
                 replay_keyword_arguments={},
-                config=cfg,
-                storage=stor,
+                config=config,
+                storage=storage,
                 strict=True,
             )
-        path = result.location  # type: ignore[union-attr]
-        raw = Path(path).read_bytes()
-        self.assertNotIn(secret.encode(), raw)
 
-    def test_token_in_kwargs_not_in_zip_bytes(self):
+        path = result.location  # type: ignore[union-attr]
+        self.assertNotIn(secret.encode(), _archive_payload_bytes(path))
+
+    def test_token_in_keyword_arguments_not_in_package_payloads(self):
         secret = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
-        cfg = TraceSeedConfig(output_directory=Path(self.tmp))
-        stor = ArchiveStorage(cfg, SafeSerializer(cfg))
+        token_value = b"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        config = TraceSeedConfig(output_directory=Path(self.tmp))
+        storage = ArchiveStorage(config, SafeSerializer(config))
+
         try:
             raise RuntimeError("test")
-        except RuntimeError as exc:
+        except RuntimeError as error:
             result = capture_exception(
-                exc,
+                error,
                 callable_info=CallableInfo("tests.replay_targets", "add", True),
                 replay_arguments=(1,),
                 replay_keyword_arguments={"token": secret},
-                config=cfg,
-                storage=stor,
+                config=config,
+                storage=storage,
                 strict=True,
             )
-        path = result.location  # type: ignore[union-attr]
-        raw = Path(path).read_bytes()
-        self.assertNotIn(b"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", raw)
 
-    def test_replay_disabled_when_arg_redacted(self):
-        """replay.json deve declarar replayable=False quando argumento é redigido."""
+        path = result.location  # type: ignore[union-attr]
+        self.assertNotIn(token_value, _archive_payload_bytes(path))
+
+    def test_replay_disabled_when_argument_is_redacted(self):
         storage = MemoryStorage()
+
         try:
             raise RuntimeError("test")
-        except RuntimeError as exc:
+        except RuntimeError as error:
             capture_exception(
-                exc,
+                error,
                 callable_info=CallableInfo("tests.replay_targets", "add", True),
                 replay_arguments=({"api_key": "secret-key-value"},),
                 replay_keyword_arguments={},
                 storage=storage,
             )
+
         replay = storage.extras[0].get("replay")
         self.assertIsNotNone(replay)
-        self.assertFalse(replay["replayable"])
+        self.assertIs(replay["replayable"], False)
         self.assertNotIn("secret-key-value", str(replay))
 
-    def test_replay_disabled_when_arg_has_bearer_token(self):
-        """Bearer token em argumento desabilita replay."""
+    def test_replay_disabled_when_argument_contains_bearer_token(self):
         storage = MemoryStorage()
+
         try:
             raise RuntimeError("test")
-        except RuntimeError as exc:
+        except RuntimeError as error:
             capture_exception(
-                exc,
+                error,
                 callable_info=CallableInfo("tests.replay_targets", "add", True),
                 replay_arguments=("Bearer supersecrettoken123",),
                 replay_keyword_arguments={},
                 storage=storage,
             )
+
         replay = storage.extras[0].get("replay")
         self.assertIsNotNone(replay)
-        self.assertFalse(replay["replayable"])
+        self.assertIs(replay["replayable"], False)
 
-    def test_replay_enabled_with_safe_args(self):
-        """Argumentos sem segredos devem manter replay habilitado."""
+    def test_replay_enabled_with_safe_arguments(self):
         storage = MemoryStorage()
+
         try:
             raise RuntimeError("test")
-        except RuntimeError as exc:
+        except RuntimeError as error:
             capture_exception(
-                exc,
+                error,
                 callable_info=CallableInfo("tests.replay_targets", "add", True),
                 replay_arguments=(2,),
                 replay_keyword_arguments={"b": 3},
                 storage=storage,
             )
+
         replay = storage.extras[0].get("replay")
         self.assertIsNotNone(replay)
-        self.assertTrue(replay.get("replayable", True))
+        self.assertIs(replay["replayable"], True)
 
-    def test_raw_args_not_in_record_json(self):
-        """record.json não deve conter replay_arguments nem replay_keyword_arguments."""
+    def test_raw_replay_arguments_are_not_stored_on_failure_record(self):
         storage = MemoryStorage()
         secret = "raw-secret-in-replay-args"
+
         try:
             raise RuntimeError("test")
-        except RuntimeError as exc:
+        except RuntimeError as error:
             capture_exception(
-                exc,
+                error,
                 callable_info=CallableInfo("tests.replay_targets", "add", True),
                 replay_arguments=({"password": secret},),
                 replay_keyword_arguments={},
                 storage=storage,
             )
-        record_json = json.dumps(storage.extras[0])
-        self.assertNotIn(secret, record_json)
-        # FailureRecord não deve ter replay_arguments nos campos
-        record = storage.records[0]
-        self.assertFalse(hasattr(record, "replay_arguments"))
 
-    def test_runner_raises_on_replayable_false(self):
-        """ReplayRunner.run() deve lançar ReplayError se replay.json contém replayable=false."""
-        cfg = TraceSeedConfig(output_directory=Path(self.tmp))
-        stor = ArchiveStorage(cfg, SafeSerializer(cfg))
+        serialized_extra = json.dumps(storage.extras[0])
+        self.assertNotIn(secret, serialized_extra)
+        self.assertFalse(hasattr(storage.records[0], "replay_arguments"))
+
+    def test_runner_rejects_replayable_false(self):
+        config = TraceSeedConfig(output_directory=Path(self.tmp))
+        storage = ArchiveStorage(config, SafeSerializer(config))
+
         try:
             raise RuntimeError("test")
-        except RuntimeError as exc:
+        except RuntimeError as error:
             result = capture_exception(
-                exc,
+                error,
                 callable_info=CallableInfo("tests.replay_targets", "add", True),
                 replay_arguments=({"password": "secret"},),
                 replay_keyword_arguments={},
-                config=cfg,
-                storage=stor,
+                config=config,
+                storage=storage,
                 strict=True,
             )
+
         path = result.location  # type: ignore[union-attr]
-        runner = ReplayRunner(cfg)
-        with self.assertRaises(ReplayError) as ctx:
+        runner = ReplayRunner(config)
+        with self.assertRaises(ReplayError) as context:
             runner.run(path, allow_code_execution=True)
-        self.assertIn("desabilitado", str(ctx.exception))
+
+        message = str(context.exception).lower()
+        self.assertIn("disabled", message)
+        self.assertIn("redacted or truncated", message)
 
     def test_runner_executes_safe_replay(self):
-        """ReplayRunner.run() deve funcionar com argumentos seguros."""
-        cfg = TraceSeedConfig(output_directory=Path(self.tmp))
-        stor = ArchiveStorage(cfg, SafeSerializer(cfg))
+        config = TraceSeedConfig(output_directory=Path(self.tmp))
+        storage = ArchiveStorage(config, SafeSerializer(config))
+
         try:
             raise RuntimeError("test")
-        except RuntimeError as exc:
+        except RuntimeError as error:
             result = capture_exception(
-                exc,
+                error,
                 callable_info=CallableInfo("tests.replay_targets", "add", True),
                 replay_arguments=(2,),
                 replay_keyword_arguments={"b": 3},
-                config=cfg,
-                storage=stor,
+                config=config,
+                storage=storage,
                 strict=True,
             )
+
         path = result.location  # type: ignore[union-attr]
-        runner = ReplayRunner(cfg)
-        value = runner.run(path, allow_code_execution=True)
+        value = ReplayRunner(config).run(path, allow_code_execution=True)
         self.assertEqual(value, 5)
 
-    def test_replay_blocked_without_hashes(self):
-        """Replay deve ser bloqueado quando include_package_hashes=False."""
-        cfg = TraceSeedConfig(
-            output_directory=Path(self.tmp),
-            include_package_hashes=False,
-        )
-        stor = ArchiveStorage(cfg, SafeSerializer(cfg))
-        try:
-            raise RuntimeError("test")
-        except RuntimeError as exc:
-            result = capture_exception(
-                exc,
-                callable_info=CallableInfo("tests.replay_targets", "add", True),
-                replay_arguments=(2,),
-                replay_keyword_arguments={"b": 3},
-                config=cfg,
-                storage=stor,
-                strict=True,
+    def test_configuration_rejects_disabling_package_hashes(self):
+        with self.assertRaises(ConfigurationError) as context:
+            TraceSeedConfig(
+                output_directory=Path(self.tmp),
+                include_package_hashes=False,
             )
-        path = result.location  # type: ignore[union-attr]
-        # replay.json não deve ter sido incluído (hashes desabilitados)
-        with zipfile.ZipFile(path) as zf:
-            self.assertNotIn("replay.json", zf.namelist())
+
+        message = str(context.exception).lower()
+        self.assertIn("hashes", message)
+        self.assertIn("mandatory", message)
 
 
 class TestManifestReplayHashEnforcement(unittest.TestCase):
-    """Replay bloqueado quando replay.json não tem hash."""
+    """A replay payload must be declared and hashed by the manifest."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -237,30 +221,46 @@ class TestManifestReplayHashEnforcement(unittest.TestCase):
 
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_empty_hashes_blocks_replay(self):
-        # files=[] e hashes={} passam na validação estrutural; o bloco
-        # _check_replay_hash() detecta hashes vazio e levanta ReplayError.
+    def test_replay_declared_without_hash_is_rejected(self):
+        replay = json.dumps(
+            {
+                "replayable": True,
+                "module": "tests.replay_targets",
+                "qualname": "add",
+                "arguments": [2],
+                "keyword_arguments": {"b": 3},
+            }
+        ).encode()
         manifest = json.dumps(
             {
                 "format": "traceseed",
                 "format_version": 1,
                 "library_version": "0.1.0",
-                "files": [],
-                "hashes": {},  # vazio — bloqueia replay
+                "files": ["replay.json"],
+                "hashes": {},
             }
         ).encode()
-        path = Path(self.tmp) / "no_hashes.tseed"
-        with zipfile.ZipFile(path, "w") as zf:
-            zf.writestr("manifest.json", manifest)
-        runner = ReplayRunner()
-        with self.assertRaises(ReplayError):
-            runner.run(str(path), allow_code_execution=True)
+        path = Path(self.tmp) / "missing_replay_hash.tseed"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("manifest.json", manifest)
+            archive.writestr("replay.json", replay)
 
-    def test_replay_json_without_hash_blocks_replay(self):
-        import hashlib
+        with self.assertRaises(InvalidPackageError) as context:
+            ReplayRunner().run(str(path), allow_code_execution=True)
 
+        self.assertIn("must match exactly", str(context.exception).lower())
+
+    def test_undeclared_replay_payload_is_rejected(self):
         summary = b"{}"
-        # summary.json tem hash, mas replay.json não
+        replay = json.dumps(
+            {
+                "replayable": True,
+                "module": "tests.replay_targets",
+                "qualname": "add",
+                "arguments": [2],
+                "keyword_arguments": {"b": 3},
+            }
+        ).encode()
         hashes = {"summary.json": hashlib.sha256(summary).hexdigest()}
         manifest = json.dumps(
             {
@@ -271,14 +271,18 @@ class TestManifestReplayHashEnforcement(unittest.TestCase):
                 "hashes": hashes,
             }
         ).encode()
-        path = Path(self.tmp) / "no_replay_hash.tseed"
-        with zipfile.ZipFile(path, "w") as zf:
-            zf.writestr("manifest.json", manifest)
-            zf.writestr("summary.json", summary)
-            # replay.json adicionado mas não declarado no manifesto
-        runner = ReplayRunner()
-        with self.assertRaises(ReplayError):
-            runner.run(str(path), allow_code_execution=True)
+        path = Path(self.tmp) / "undeclared_replay.tseed"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("manifest.json", manifest)
+            archive.writestr("summary.json", summary)
+            archive.writestr("replay.json", replay)
+
+        with self.assertRaises(InvalidPackageError) as context:
+            ReplayRunner().run(str(path), allow_code_execution=True)
+
+        message = str(context.exception).lower()
+        self.assertIn("archive members", message)
+        self.assertIn("manifest", message)
 
 
 if __name__ == "__main__":

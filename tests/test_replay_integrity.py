@@ -1,4 +1,4 @@
-"""Garante que integridade é verificada ANTES de qualquer execução de código."""
+"""Ensure package integrity is verified before any replay code executes."""
 
 import hashlib
 import json
@@ -12,7 +12,7 @@ from traceseed.replay.runner import ReplayRunner
 
 
 def _make_valid_replay_package(tmp: str) -> str:
-    """Cria um pacote .tseed com replay.json válido e hashes corretos."""
+    """Create a replay package with valid hashes."""
     replay_data = json.dumps(
         {
             "module": "tests.replay_targets",
@@ -23,33 +23,37 @@ def _make_valid_replay_package(tmp: str) -> str:
     ).encode()
 
     files = {
-        "manifest.json": b"",  # preenchido depois
+        "manifest.json": b"",
         "replay.json": replay_data,
         "summary.json": b"{}",
     }
-    hashes = {k: hashlib.sha256(v).hexdigest() for k, v in files.items() if k != "manifest.json"}
+    hashes = {
+        name: hashlib.sha256(content).hexdigest()
+        for name, content in files.items()
+        if name != "manifest.json"
+    }
     manifest = json.dumps(
         {
             "format": "traceseed",
             "format_version": 1,
             "library_version": "0.1.0",
-            "files": [k for k in files if k != "manifest.json"],
+            "files": [name for name in files if name != "manifest.json"],
             "hashes": hashes,
         }
     ).encode()
     files["manifest.json"] = manifest
 
     path = os.path.join(tmp, "valid_replay.tseed")
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, content in files.items():
-            zf.writestr(name, content)
+            archive.writestr(name, content)
     return path
 
 
-def _tamper_replay_json(src: str, dst: str) -> None:
-    """Copia o pacote mas modifica replay.json para injetar outro callable."""
-    with zipfile.ZipFile(src, "r") as zf:
-        original = {name: zf.read(name) for name in zf.namelist()}
+def _tamper_replay_json(source: str, destination: str) -> None:
+    """Copy a package and replace replay.json without updating its hash."""
+    with zipfile.ZipFile(source, "r") as archive:
+        original = {name: archive.read(name) for name in archive.namelist()}
 
     original["replay.json"] = json.dumps(
         {
@@ -60,9 +64,9 @@ def _tamper_replay_json(src: str, dst: str) -> None:
         }
     ).encode()
 
-    with zipfile.ZipFile(dst, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, content in original.items():
-            zf.writestr(name, content)
+            archive.writestr(name, content)
 
 
 class TestReplayIntegrity(unittest.TestCase):
@@ -93,9 +97,13 @@ class TestReplayIntegrity(unittest.TestCase):
 
     def test_run_without_allow_raises(self):
         valid = _make_valid_replay_package(self.tmp)
-        with self.assertRaises(ReplayError) as ctx:
+
+        with self.assertRaises(ReplayError) as context:
             self.runner.run(valid)
-        self.assertIn("allow_code_execution", str(ctx.exception))
+
+        message = str(context.exception).lower()
+        self.assertIn("authorization", message)
+        self.assertIn("application code", message)
 
     def test_package_without_replay_json_raises(self):
         manifest = json.dumps(
@@ -108,15 +116,16 @@ class TestReplayIntegrity(unittest.TestCase):
             }
         ).encode()
         path = os.path.join(self.tmp, "no_replay.tseed")
-        with zipfile.ZipFile(path, "w") as zf:
-            zf.writestr("manifest.json", manifest)
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("manifest.json", manifest)
+
         with self.assertRaises(ReplayError):
             self.runner.inspect(path)
 
     def test_missing_manifest_raises_before_import(self):
         path = os.path.join(self.tmp, "no_manifest.tseed")
-        with zipfile.ZipFile(path, "w") as zf:
-            zf.writestr(
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr(
                 "replay.json",
                 json.dumps(
                     {
@@ -127,6 +136,7 @@ class TestReplayIntegrity(unittest.TestCase):
                     }
                 ),
             )
+
         with self.assertRaises(InvalidPackageError):
             self.runner.run(path, allow_code_execution=True)
 
