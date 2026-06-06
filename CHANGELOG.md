@@ -10,7 +10,7 @@
 - Serialização JSON segura e extensível.
 - Fingerprints normalizadas.
 - Storages em arquivo, diretório e memória.
-- Pacotes `.fprint` com hashes de integridade.
+- Pacotes `.tseed` com hashes de integridade.
 - CLI `show`, `verify`, `list`, `compare` e `replay`.
 - Hooks para exceções globais, threads e asyncio.
 - Replay assistido com autorização explícita.

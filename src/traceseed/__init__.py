@@ -10,9 +10,11 @@ from .api import (
     get_last_capture,
     guard,
     install,
+    install_asyncio,
     register_codec,
     register_collector,
     uninstall,
+    uninstall_asyncio,
     unregister_codec,
     unregister_collector,
 )
@@ -25,6 +27,15 @@ from .context import (
     current_context,
     reset_context,
     set_context,
+)
+from .errors import (
+    ConfigurationError,
+    IntegrityError,
+    InvalidPackageError,
+    ReplayError,
+    SerializationError,
+    StorageError,
+    TraceSeedError,
 )
 from .models import (
     Breadcrumb,
@@ -46,11 +57,21 @@ __all__ = [
     "get_last_capture",
     "guard",
     "install",
+    "install_asyncio",
     "register_codec",
     "register_collector",
     "uninstall",
+    "uninstall_asyncio",
     "unregister_codec",
     "unregister_collector",
+    # errors
+    "TraceSeedError",
+    "ConfigurationError",
+    "IntegrityError",
+    "InvalidPackageError",
+    "ReplayError",
+    "SerializationError",
+    "StorageError",
     # config
     "TraceSeedConfig",
     "configure",

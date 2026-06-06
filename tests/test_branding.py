@@ -43,5 +43,38 @@ class BrandingTests(unittest.TestCase):
         self.assertNotIn(old_marker, encoded)
 
 
+class BrandingFileScanTests(unittest.TestCase):
+    """Varre arquivos de texto do projeto procurando referências antigas."""
+
+    _TEXT_EXTENSIONS = {".py", ".md", ".toml", ".cfg", ".ini", ".txt", ".yml", ".yaml", ".rst"}
+    _SKIP_DIRS = {"__pycache__", ".git", ".eggs", "traceseed.egg-info", "node_modules", ".venv"}
+    _OLD_NAMES = ("failprint", "Failprint", "FailprintConfig", ".fprint")
+
+    def test_no_old_branding_in_source_files(self):
+        root = Path(__file__).parent.parent
+        this_file = Path(__file__).resolve()
+        violations = []
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.resolve() == this_file:
+                continue  # O próprio arquivo contém os nomes por necessidade
+            if any(skip in path.parts for skip in self._SKIP_DIRS):
+                continue
+            if path.suffix not in self._TEXT_EXTENSIONS:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for old_name in self._OLD_NAMES:
+                if old_name in text:
+                    rel = path.relative_to(root)
+                    violations.append(f"{rel}: contém '{old_name}'")
+
+        if violations:
+            self.fail("Referências antigas encontradas:\n" + "\n".join(sorted(violations)))
+
+
 if __name__ == "__main__":
     unittest.main()

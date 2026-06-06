@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -13,11 +13,11 @@ class ExceptionInfo:
     type_name: str
     message: str
     representation: str
-    cause: "ExceptionInfo | None" = None
-    context: "ExceptionInfo | None" = None
+    cause: ExceptionInfo | None = None
+    context: ExceptionInfo | None = None
     suppress_context: bool = False
     notes: tuple[str, ...] = ()
-    children: tuple["ExceptionInfo", ...] = ()
+    children: tuple[ExceptionInfo, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +93,7 @@ class FailureRecord:
 
     @staticmethod
     def utc_now() -> datetime:
-        return datetime.now(timezone.utc)
+        return datetime.now(UTC)
 
 
 @dataclass(frozen=True, slots=True)

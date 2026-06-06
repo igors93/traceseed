@@ -31,7 +31,9 @@ class FingerprintTests(unittest.TestCase):
         self.assertEqual(self.fp.normalize_message("at 0xABCDEF"), "at <hex>")
 
     def test_long_token_is_normalized(self):
-        self.assertEqual(self.fp.normalize_message("token abcdefghijklmnopqrstuvwxyz123"), "token <token>")
+        self.assertEqual(
+            self.fp.normalize_message("token abcdefghijklmnopqrstuvwxyz123"), "token <token>"
+        )
 
     def test_different_exception_type_changes_fingerprint(self):
         one = self.fp.generate(self.info("bad"), (self.frame,))

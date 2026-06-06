@@ -6,7 +6,7 @@
 2. Falhas internas nunca escondem a exceção original.
 3. Dados sensíveis são removidos antes da persistência.
 4. Componentes de coleta, serialização e armazenamento podem ser substituídos.
-5. O formato `.fprint` é verificável e versionado.
+5. O formato `.tseed` é verificável e versionado.
 6. A biblioteca padrão do Python é suficiente em runtime e nos testes.
 
 ## Fluxo
@@ -29,7 +29,7 @@
           FailureRecord
                  │
                  ▼
-       .fprint / diretório / memória
+       .tseed / diretório / memória
 ```
 
 ## API pública
@@ -111,7 +111,7 @@ Valores variáveis como números, UUIDs, tokens longos e endereços hexadecimais
 
 ### ArchiveStorage
 
-Cria um ZIP com extensão `.fprint`. Todos os arquivos diagnósticos recebem SHA-256 no manifesto. A gravação usa arquivo temporário e `os.replace`.
+Cria um ZIP com extensão `.tseed`. Todos os arquivos diagnósticos recebem SHA-256 no manifesto. A gravação usa arquivo temporário e `os.replace`.
 
 ### DirectoryStorage
 

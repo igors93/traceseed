@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .config import TraceSeedConfig
 from .errors import IntegrityError, InvalidPackageError, ReplayError
@@ -26,7 +26,7 @@ def _load_summary(storage: ArchiveStorage, path: str) -> dict[str, Any]:
     files = storage.load_files(path)
     if "summary.json" not in files:
         raise InvalidPackageError("summary.json ausente")
-    return json.loads(files["summary.json"].decode("utf-8"))
+    return cast(dict[str, Any], json.loads(files["summary.json"].decode("utf-8")))
 
 
 def _cmd_show(args: argparse.Namespace) -> int:
@@ -49,7 +49,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Exception:    {exc_info.get('type_name', '?')}: {exc_info.get('message', '?')}")
     top = summary.get("top_frame")
     if top:
-        print(f"Top frame:    {top.get('filename')}:{top.get('line_number')} in {top.get('function')}")
+        print(
+            f"Top frame:    {top.get('filename')}:{top.get('line_number')} in {top.get('function')}"
+        )
     collector_errors = summary.get("collector_errors", [])
     if collector_errors:
         print(f"Collector errors: {len(collector_errors)}")

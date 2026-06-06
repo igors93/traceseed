@@ -2,7 +2,7 @@
 
 **Transforme falhas Python em pacotes diagnósticos verificáveis e, quando possível, reproduzíveis.**
 
-TraceSeed é uma biblioteca modular com **zero dependências em runtime**. Ela captura uma exceção, coleta o contexto útil, remove informações sensíveis, gera uma fingerprint estável e salva um pacote `.fprint` com hashes de integridade.
+TraceSeed é uma biblioteca modular com **zero dependências em runtime**. Ela captura uma exceção, coleta o contexto útil, remove informações sensíveis, gera uma fingerprint estável e salva um pacote `.tseed` com hashes de integridade.
 
 > Estado: versão inicial `0.1.0`, pronta para estudo, evolução e uso controlado. O replay é assistido e deve ser usado somente com pacotes confiáveis.
 
@@ -14,7 +14,7 @@ TraceSeed é uma biblioteca modular com **zero dependências em runtime**. Ela c
 - Argumentos, locals opcionais, traceback, runtime, threads e breadcrumbs.
 - Sanitização por nome de campo, regex e função personalizada.
 - Fingerprint que normaliza IDs, números, UUIDs, tokens longos e endereços hexadecimais.
-- Pacotes `.fprint` em ZIP com manifesto e SHA-256.
+- Pacotes `.tseed` em ZIP com manifesto e SHA-256.
 - Escrita atômica para evitar pacotes incompletos.
 - Storages em arquivo, diretório e memória.
 - Coletores e serializers extensíveis.
@@ -83,7 +83,7 @@ O erro original continua sendo lançado e um pacote será criado em `.traceseeds
 
 ```text
 .traceseeds/
-└── process-payment-fp_9c41...-2ac39f10.fprint
+└── process-payment-traceseed-9c41...-2ac39f10.tseed
 ```
 
 O token é removido antes da persistência.
@@ -218,7 +218,7 @@ def calculate_tax(amount, rate):
 O replay só é gerado quando o callable é importável e todos os argumentos são reconstruíveis.
 
 ```bash
-traceseed replay failure.fprint --allow-code-execution
+traceseed replay failure.tseed --allow-code-execution
 ```
 
 **Atenção:** replay importa módulos e executa código da aplicação. Nunca reproduza um pacote recebido de fonte não confiável.
@@ -226,18 +226,18 @@ traceseed replay failure.fprint --allow-code-execution
 ## CLI
 
 ```bash
-traceseed show error.fprint
-traceseed show error.fprint --json
-traceseed verify error.fprint
+traceseed show error.tseed
+traceseed show error.tseed --json
+traceseed verify error.tseed
 traceseed list .traceseeds
-traceseed compare first.fprint second.fprint
-traceseed replay error.fprint --allow-code-execution
+traceseed compare first.tseed second.tseed
+traceseed replay error.tseed --allow-code-execution
 ```
 
 Sem instalação:
 
 ```bash
-PYTHONPATH=src python -m traceseed show error.fprint
+PYTHONPATH=src python -m traceseed show error.tseed
 ```
 
 ## Testes

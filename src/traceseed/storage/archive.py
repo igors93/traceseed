@@ -8,10 +8,9 @@ import os
 import re
 import tempfile
 import zipfile
-from dataclasses import asdict, is_dataclass
-from datetime import datetime
+from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from ..config import TraceSeedConfig
 from ..errors import IntegrityError, InvalidPackageError, StorageError
@@ -20,6 +19,10 @@ from ..serialization import SafeSerializer
 from .base import StoredFailure
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+_REQUIRED_MANIFEST_FIELDS = frozenset(
+    {"format", "format_version", "library_version", "files", "hashes"}
+)
+_VALID_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ArchiveStorage:
@@ -71,72 +74,173 @@ class ArchiveStorage:
             raise StorageError(f"não foi possível salvar pacote: {error}") from error
         finally:
             if temporary is not None and temporary.exists():
-                try:
+                with suppress(OSError):
                     temporary.unlink()
-                except OSError:
-                    pass
 
     def load_files(self, location: str | Path) -> dict[str, bytes]:
+        """Lê arquivo .tseed com proteção contra ZIP bomb e caminhos inseguros."""
         path = Path(location)
+        cfg = self.config
         try:
             with zipfile.ZipFile(path, "r") as archive:
                 bad = archive.testzip()
                 if bad:
                     raise IntegrityError(f"arquivo ZIP corrompido: {bad}")
-                names = archive.namelist()
-                if any(name.startswith("/") or ".." in Path(name).parts for name in names):
-                    raise InvalidPackageError("pacote contém caminho inseguro")
-                return {name: archive.read(name) for name in names}
+
+                infos = archive.infolist()
+
+                # Proteção: número de entradas
+                if len(infos) > cfg.max_archive_files:
+                    raise InvalidPackageError(
+                        f"pacote contém {len(infos)} arquivos (limite: {cfg.max_archive_files})"
+                    )
+
+                # Proteção: entradas duplicadas
+                seen_names: set[str] = set()
+                for info in infos:
+                    if info.filename in seen_names:
+                        raise InvalidPackageError(f"entrada duplicada no ZIP: {info.filename!r}")
+                    seen_names.add(info.filename)
+
+                # Proteção: caminhos inseguros
+                for info in infos:
+                    name = info.filename
+                    if name.startswith("/") or name.startswith("\\"):
+                        raise InvalidPackageError(f"caminho absoluto no pacote: {name!r}")
+                    if ".." in Path(name).parts:
+                        raise InvalidPackageError(f"caminho com '..' no pacote: {name!r}")
+
+                # Proteção: razão de compressão e tamanho por arquivo
+                for info in infos:
+                    compressed = info.compress_size
+                    uncompressed = info.file_size
+                    if uncompressed > cfg.max_archive_file_size:
+                        raise InvalidPackageError(
+                            f"{info.filename!r}: arquivo descompactado muito grande "
+                            f"({uncompressed} bytes, limite: {cfg.max_archive_file_size})"
+                        )
+                    if compressed > 0 and uncompressed / compressed > cfg.max_compression_ratio:
+                        raise InvalidPackageError(
+                            f"{info.filename!r}: razão de compressão suspeita "
+                            f"({uncompressed}/{compressed})"
+                        )
+
+                # Proteção: tamanho total descompactado
+                total_uncompressed = sum(info.file_size for info in infos)
+                if total_uncompressed > cfg.max_archive_total_size:
+                    raise InvalidPackageError(
+                        f"tamanho total descompactado excede limite: "
+                        f"{total_uncompressed} bytes (limite: {cfg.max_archive_total_size})"
+                    )
+
+                # Proteção especial para manifest.json
+                manifest_info = next((i for i in infos if i.filename == "manifest.json"), None)
+                if manifest_info and manifest_info.file_size > cfg.max_manifest_size:
+                    raise InvalidPackageError(
+                        f"manifest.json muito grande: {manifest_info.file_size} bytes "
+                        f"(limite: {cfg.max_manifest_size})"
+                    )
+
+                return {info.filename: archive.read(info.filename) for info in infos}
         except zipfile.BadZipFile as error:
             raise InvalidPackageError("arquivo não é um pacote .tseed válido") from error
+        except (IntegrityError, InvalidPackageError):
+            raise
         except OSError as error:
             raise InvalidPackageError(str(error)) from error
 
     def verify(self, location: str | Path) -> dict[str, Any]:
+        """Verifica integridade completa do pacote antes de qualquer uso."""
         files = self.load_files(location)
+
         if "manifest.json" not in files:
             raise InvalidPackageError("manifest.json ausente")
+
         try:
             manifest = json.loads(files["manifest.json"].decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise InvalidPackageError("manifest.json inválido") from error
+
+        # Valida campos obrigatórios do manifesto
+        missing = _REQUIRED_MANIFEST_FIELDS - set(manifest.keys())
+        if missing:
+            raise InvalidPackageError(f"manifest.json faltam campos: {sorted(missing)}")
+
         if manifest.get("format") != "traceseed":
-            raise InvalidPackageError("formato desconhecido")
-        expected = manifest.get("hashes", {})
+            raise InvalidPackageError(f"formato desconhecido: {manifest.get('format')!r}")
+
+        if not isinstance(manifest.get("format_version"), int):
+            raise InvalidPackageError("manifest.json: format_version deve ser inteiro")
+
+        if not isinstance(manifest.get("library_version"), str):
+            raise InvalidPackageError("manifest.json: library_version deve ser string")
+
+        declared_files = manifest.get("files", [])
+        if not isinstance(declared_files, list):
+            raise InvalidPackageError("manifest.json: 'files' deve ser lista")
+
+        expected_hashes = manifest.get("hashes", {})
+        if not isinstance(expected_hashes, dict):
+            raise InvalidPackageError("manifest.json: 'hashes' deve ser objeto")
+
+        # Valida formato dos hashes (devem ser SHA-256 hex de 64 chars)
+        for fname, digest in expected_hashes.items():
+            if not isinstance(digest, str) or not _VALID_HASH_RE.match(digest):
+                raise InvalidPackageError(
+                    f"manifest.json: hash inválido para {fname!r}: {digest!r}"
+                )
+
+        # Verifica arquivos inesperados não declarados no manifesto (exceto manifest.json)
+        known = set(declared_files) | {"manifest.json"}
+        extra_files = set(files.keys()) - known
+        if extra_files:
+            raise InvalidPackageError(
+                f"arquivos não declarados no manifesto: {sorted(extra_files)}"
+            )
+
+        # Verifica integridade de cada hash declarado
         mismatches = []
-        for name, digest in expected.items():
+        for name, digest in expected_hashes.items():
             if name not in files:
                 mismatches.append(f"ausente:{name}")
                 continue
             actual = hashlib.sha256(files[name]).hexdigest()
             if actual != digest:
                 mismatches.append(f"alterado:{name}")
+
         if mismatches:
             raise IntegrityError(", ".join(mismatches))
-        return manifest
+
+        return cast(dict[str, Any], manifest)
 
     def _build_files(self, record: FailureRecord, extra: dict[str, Any]) -> dict[str, bytes]:
         record_data = self.serializer.encode(record)
         files = {
-            "summary.json": self._json_bytes({
-                "incident_id": record.incident_id,
-                "fingerprint": record.fingerprint,
-                "created_at": record.created_at.isoformat(),
-                "operation": record.operation,
-                "exception": {
-                    "module": record.exception.module,
-                    "type_name": record.exception.type_name,
-                    "message": record.exception.message,
-                },
-                "top_frame": ({
-                    "filename": record.frames[-1].filename,
-                    "function": record.frames[-1].function,
-                    "line_number": record.frames[-1].line_number,
-                } if record.frames else None),
-                "collector_errors": list(record.collector_errors),
-                "extension_keys": sorted(record.extensions),
-                "replayable": bool(record.callable_info and record.callable_info.replayable),
-            }),
+            "summary.json": self._json_bytes(
+                {
+                    "incident_id": record.incident_id,
+                    "fingerprint": record.fingerprint,
+                    "created_at": record.created_at.isoformat(),
+                    "operation": record.operation,
+                    "exception": {
+                        "module": record.exception.module,
+                        "type_name": record.exception.type_name,
+                        "message": record.exception.message,
+                    },
+                    "top_frame": (
+                        {
+                            "filename": record.frames[-1].filename,
+                            "function": record.frames[-1].function,
+                            "line_number": record.frames[-1].line_number,
+                        }
+                        if record.frames
+                        else None
+                    ),
+                    "collector_errors": list(record.collector_errors),
+                    "extension_keys": sorted(record.extensions),
+                    "replayable": bool(record.callable_info and record.callable_info.replayable),
+                }
+            ),
             "record.json": self._json_bytes(record_data),
             "exception.json": self._json_bytes(self.serializer.encode(record.exception)),
             "traceback.json": self._json_bytes(self.serializer.encode(record.frames)),

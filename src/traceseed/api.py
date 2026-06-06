@@ -1,4 +1,11 @@
-"""API pública: decoradores, context managers, hooks globais e registro."""
+"""API pública: decoradores, context managers, hooks globais e registro.
+
+Semântica de strict:
+  strict=False (padrão): falhas internas de captura não substituem a exceção
+    original; o erro vai para stderr; re_raise continua funcionando normalmente.
+  strict=True: falhas internas levantam StorageError (com exceção original como
+    __cause__); o comportamento é igual nos quatro contextos de captura.
+"""
 
 from __future__ import annotations
 
@@ -7,22 +14,15 @@ import functools
 import inspect
 import sys
 import threading
-from contextlib import contextmanager
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, suppress
 from inspect import BoundArguments
-from typing import Any, Callable, Generator, TypeVar
+from typing import Any, TypeVar
 
 from .collectors import CollectorRegistry
 from .config import TraceSeedConfig, get_config
-from .context import clear_context as _clear_context  # noqa: F401 (re-exported)
-from .context import context as _context_cm  # noqa: F401 (re-exported)
-from .context import (
-    breadcrumb as _breadcrumb,
-    current_breadcrumbs,
-    current_context,
-    reset_context,
-    set_context,
-)
 from .engine import CaptureEngine
+from .errors import StorageError
 from .models import CallableInfo, CaptureContext, CaptureResult
 from .serialization import SafeSerializer
 from .storage.archive import ArchiveStorage
@@ -34,8 +34,10 @@ _global_codecs: dict[str, Any] = {}
 _installed: bool = False
 _old_excepthook: Any = None
 _old_thread_excepthook: Any = None
-_old_loop_handler: Any = None
 _last_capture: CaptureResult | None = None
+
+# install_asyncio state: maps loop id -> old handler
+_asyncio_handlers: dict[int, Any] = {}
 
 _SKIP_TYPES = (KeyboardInterrupt, SystemExit)
 
@@ -56,9 +58,7 @@ def _is_importable(func: Callable[..., Any]) -> bool:
     qualname = getattr(func, "__qualname__", "")
     if module in (None, "__main__"):
         return False
-    if "<locals>" in qualname:
-        return False
-    return True
+    return "<locals>" not in qualname
 
 
 def _bind_arguments(func: Callable[..., Any], args: tuple, kwargs: dict) -> dict[str, Any]:
@@ -69,6 +69,16 @@ def _bind_arguments(func: Callable[..., Any], args: tuple, kwargs: dict) -> dict
         return dict(bound.arguments)
     except (TypeError, ValueError):
         return {}
+
+
+def _raise_strict(storage_error_msg: str, original: BaseException) -> None:
+    """Levanta StorageError preservando a exceção original como __cause__."""
+    raise StorageError(storage_error_msg) from original
+
+
+# ---------------------------------------------------------------------------
+# capture_exception
+# ---------------------------------------------------------------------------
 
 
 def capture_exception(
@@ -111,8 +121,7 @@ def capture_exception(
 
     if result.capture_error:
         if strict:
-            from .errors import StorageError
-            raise StorageError(result.capture_error)
+            raise StorageError(result.capture_error) from exception
         print(f"traceseed: {result.capture_error}", file=sys.stderr)
         return None
 
@@ -120,76 +129,15 @@ def capture_exception(
     _last_capture = result
 
     if on_captured is not None:
-        try:
+        with suppress(Exception):
             on_captured(result)
-        except Exception:
-            pass
 
     return result
 
 
-def _do_capture(
-    func: Callable[..., Any],
-    args: tuple,
-    kwargs: dict,
-    *,
-    cfg: TraceSeedConfig,
-    storage: Any,
-    operation: str | None,
-    replayable: bool,
-    on_captured: Callable | None,
-    strict: bool,
-) -> CaptureResult | None:
-    arguments = _bind_arguments(func, args, kwargs)
-    callable_info: CallableInfo | None = None
-    replay_args: tuple | None = None
-    replay_kwargs: dict | None = None
-
-    if replayable:
-        importable = _is_importable(func)
-        callable_info = CallableInfo(
-            module=getattr(func, "__module__", ""),
-            qualname=getattr(func, "__qualname__", ""),
-            replayable=importable,
-            reason=None if importable else "callable não importável",
-        )
-        if importable:
-            replay_args = args
-            replay_kwargs = kwargs
-    else:
-        callable_info = CallableInfo(
-            module=getattr(func, "__module__", ""),
-            qualname=getattr(func, "__qualname__", ""),
-            replayable=False,
-        )
-
-    op = operation or getattr(func, "__qualname__", None)
-    ser = _make_serializer(cfg)
-    stor = storage if storage is not None else _default_storage(cfg, ser)
-
-    ctx = CaptureContext(
-        operation=op,
-        metadata={},
-        arguments=arguments,
-        callable_info=callable_info,
-        replay_arguments=replay_args,
-        replay_keyword_arguments=replay_kwargs,
-    )
-
-    engine = CaptureEngine(
-        config=cfg,
-        collectors=_global_registry,
-        storage=stor,
-        serializer=ser,
-    )
-
-    try:
-        result = engine.capture(func.__self__ if hasattr(func, "__self__") else func, ctx)  # type: ignore
-        return result
-    except Exception:
-        pass
-
-    return None
+# ---------------------------------------------------------------------------
+# Decorator @capture
+# ---------------------------------------------------------------------------
 
 
 def capture(
@@ -204,6 +152,7 @@ def capture(
 ) -> Any:
     def decorator(fn: F) -> F:
         if asyncio.iscoroutinefunction(fn):
+
             @functools.wraps(fn)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
                 cfg = config or get_config()
@@ -212,40 +161,25 @@ def capture(
                 except _SKIP_TYPES:
                     raise
                 except BaseException as exc:
-                    arguments = _bind_arguments(fn, args, kwargs)
-                    importable = _is_importable(fn) and replayable
-                    ci = CallableInfo(
-                        module=getattr(fn, "__module__", ""),
-                        qualname=getattr(fn, "__qualname__", ""),
-                        replayable=importable,
-                        reason=None if importable else ("callable não importável" if replayable else None),
+                    _capture_in_wrapper(
+                        fn,
+                        args,
+                        kwargs,
+                        exc,
+                        cfg,
+                        replayable,
+                        operation,
+                        storage,
+                        on_captured,
+                        strict,
                     )
-                    op = operation or getattr(fn, "__qualname__", None)
-                    ser = _make_serializer(cfg)
-                    stor = storage if storage is not None else _default_storage(cfg, ser)
-                    ctx = CaptureContext(
-                        operation=op,
-                        metadata={},
-                        arguments=arguments,
-                        callable_info=ci,
-                        replay_arguments=args if importable else None,
-                        replay_keyword_arguments=kwargs if importable else None,
-                    )
-                    engine = CaptureEngine(cfg, _global_registry, stor, ser)
-                    result = _run_engine_safe(engine, exc, ctx, strict)
-                    if result is not None:
-                        global _last_capture
-                        _last_capture = result
-                        if on_captured:
-                            try:
-                                on_captured(result)
-                            except Exception:
-                                pass
                     if cfg.re_raise:
                         raise
                     return None
+
             return async_wrapper  # type: ignore
         else:
+
             @functools.wraps(fn)
             def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
                 cfg = config or get_config()
@@ -254,38 +188,22 @@ def capture(
                 except _SKIP_TYPES:
                     raise
                 except BaseException as exc:
-                    arguments = _bind_arguments(fn, args, kwargs)
-                    importable = _is_importable(fn) and replayable
-                    ci = CallableInfo(
-                        module=getattr(fn, "__module__", ""),
-                        qualname=getattr(fn, "__qualname__", ""),
-                        replayable=importable,
-                        reason=None if importable else ("callable não importável" if replayable else None),
+                    _capture_in_wrapper(
+                        fn,
+                        args,
+                        kwargs,
+                        exc,
+                        cfg,
+                        replayable,
+                        operation,
+                        storage,
+                        on_captured,
+                        strict,
                     )
-                    op = operation or getattr(fn, "__qualname__", None)
-                    ser = _make_serializer(cfg)
-                    stor = storage if storage is not None else _default_storage(cfg, ser)
-                    ctx = CaptureContext(
-                        operation=op,
-                        metadata={},
-                        arguments=arguments,
-                        callable_info=ci,
-                        replay_arguments=args if importable else None,
-                        replay_keyword_arguments=kwargs if importable else None,
-                    )
-                    engine = CaptureEngine(cfg, _global_registry, stor, ser)
-                    result = _run_engine_safe(engine, exc, ctx, strict)
-                    if result is not None:
-                        global _last_capture
-                        _last_capture = result
-                        if on_captured:
-                            try:
-                                on_captured(result)
-                            except Exception:
-                                pass
                     if cfg.re_raise:
                         raise
                     return None
+
             return sync_wrapper  # type: ignore
 
     if func is not None:
@@ -293,17 +211,57 @@ def capture(
     return decorator
 
 
-def _run_engine_safe(
-    engine: CaptureEngine,
+def _capture_in_wrapper(
+    fn: Callable[..., Any],
+    args: tuple,
+    kwargs: dict,
     exc: BaseException,
-    ctx: CaptureContext,
-    strict: bool = False,
-) -> CaptureResult | None:
+    cfg: TraceSeedConfig,
+    replayable: bool,
+    operation: str | None,
+    storage: Any,
+    on_captured: Callable | None,
+    strict: bool,
+) -> None:
+    """Lógica comum de captura para decoradores sync e async."""
+    arguments = _bind_arguments(fn, args, kwargs)
+    importable = _is_importable(fn) and replayable
+    ci = CallableInfo(
+        module=getattr(fn, "__module__", ""),
+        qualname=getattr(fn, "__qualname__", ""),
+        replayable=importable,
+        reason=None if importable else ("callable não importável" if replayable else None),
+    )
+    op = operation or getattr(fn, "__qualname__", None)
+    ser = _make_serializer(cfg)
+    stor = storage if storage is not None else _default_storage(cfg, ser)
+    ctx = CaptureContext(
+        operation=op,
+        metadata={},
+        arguments=arguments,
+        callable_info=ci,
+        replay_arguments=args if importable else None,
+        replay_keyword_arguments=kwargs if importable else None,
+    )
+    engine = CaptureEngine(cfg, _global_registry, stor, ser)
     result = engine.capture(exc, ctx)
+
     if result.capture_error:
+        if strict:
+            raise StorageError(result.capture_error) from exc
         print(f"traceseed: {result.capture_error}", file=sys.stderr)
-        return None
-    return result
+        return
+
+    global _last_capture
+    _last_capture = result
+    if on_captured:
+        with suppress(Exception):
+            on_captured(result)
+
+
+# ---------------------------------------------------------------------------
+# guard context manager
+# ---------------------------------------------------------------------------
 
 
 @contextmanager
@@ -325,17 +283,139 @@ def guard(
         stor = storage if storage is not None else _default_storage(cfg, ser)
         ctx = CaptureContext(operation=operation, metadata={}, arguments={})
         engine = CaptureEngine(cfg, _global_registry, stor, ser)
-        result = _run_engine_safe(engine, exc, ctx, strict)
-        if result is not None:
+        result = engine.capture(exc, ctx)
+
+        if result.capture_error:
+            if strict:
+                raise StorageError(result.capture_error) from exc
+            print(f"traceseed: {result.capture_error}", file=sys.stderr)
+        else:
             global _last_capture
             _last_capture = result
             if on_captured:
-                try:
+                with suppress(Exception):
                     on_captured(result)
-                except Exception:
-                    pass
+
         if cfg.re_raise:
             raise
+
+
+# ---------------------------------------------------------------------------
+# Hooks globais
+# ---------------------------------------------------------------------------
+
+
+def install(storage: Any = None, config: TraceSeedConfig | None = None) -> None:
+    """Instala hooks em sys.excepthook e threading.excepthook.
+
+    É idempotente: chamadas repetidas não instalam hooks duplos.
+    O hook anterior (incluindo handlers customizados) é sempre chamado.
+    """
+    global _installed, _old_excepthook, _old_thread_excepthook
+
+    if _installed:
+        return
+
+    cfg = config
+    stor = storage
+    # Captura os handlers atuais antes de sobrescrever
+    prev_sys = sys.excepthook
+    prev_thread = threading.excepthook
+
+    def _sys_excepthook(exc_type: type, exc_value: BaseException, exc_tb: Any) -> None:
+        with suppress(Exception):
+            capture_exception(exc_value, config=cfg, storage=stor)
+        # Chama o handler que estava instalado antes do TraceSeed
+        try:
+            prev_sys(exc_type, exc_value, exc_tb)
+        except Exception:
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    def _thread_excepthook(hook_args: threading.ExceptHookArgs) -> None:
+        if hook_args.exc_value is not None:
+            with suppress(Exception):
+                capture_exception(hook_args.exc_value, config=cfg, storage=stor)
+        # Chama o handler anterior
+        with suppress(Exception):
+            prev_thread(hook_args)
+
+    _old_excepthook = prev_sys
+    _old_thread_excepthook = prev_thread
+    sys.excepthook = _sys_excepthook
+    threading.excepthook = _thread_excepthook
+    _installed = True
+
+
+def uninstall() -> None:
+    """Restaura exatamente os hooks que estavam instalados antes de install()."""
+    global _installed, _old_excepthook, _old_thread_excepthook
+
+    if not _installed:
+        return
+
+    if _old_excepthook is not None:
+        sys.excepthook = _old_excepthook
+    if _old_thread_excepthook is not None:
+        threading.excepthook = _old_thread_excepthook
+
+    _old_excepthook = None
+    _old_thread_excepthook = None
+    _installed = False
+
+
+def install_asyncio(
+    loop: asyncio.AbstractEventLoop | None = None,
+    storage: Any = None,
+    config: TraceSeedConfig | None = None,
+) -> asyncio.AbstractEventLoop:
+    """Instala handler de exceções no loop asyncio, preservando o handler anterior.
+
+    Retorna o loop configurado (útil para chamar uninstall_asyncio depois).
+    """
+    cfg = config
+    stor = storage
+
+    try:
+        lp = loop or asyncio.get_event_loop()
+    except RuntimeError:
+        lp = asyncio.new_event_loop()
+
+    old_handler = lp.get_exception_handler()
+    loop_id = id(lp)
+    _asyncio_handlers[loop_id] = old_handler
+
+    def _asyncio_handler(lp2: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        exc = context.get("exception")
+        if exc is not None:
+            with suppress(Exception):
+                capture_exception(exc, config=cfg, storage=stor)
+        if old_handler is not None:
+            try:
+                old_handler(lp2, context)
+            except Exception:
+                lp2.default_exception_handler(context)
+        else:
+            lp2.default_exception_handler(context)
+
+    lp.set_exception_handler(_asyncio_handler)
+    return lp
+
+
+def uninstall_asyncio(loop: asyncio.AbstractEventLoop | None = None) -> None:
+    """Restaura o handler asyncio anterior ao install_asyncio()."""
+    try:
+        lp = loop or asyncio.get_event_loop()
+    except RuntimeError:
+        return
+
+    loop_id = id(lp)
+    if loop_id in _asyncio_handlers:
+        lp.set_exception_handler(_asyncio_handlers.pop(loop_id))
+
+
+# ---------------------------------------------------------------------------
+# Registro global
+# ---------------------------------------------------------------------------
 
 
 def get_last_capture() -> CaptureResult | None:
@@ -356,50 +436,3 @@ def register_codec(codec: Any) -> None:
 
 def unregister_codec(name: str) -> None:
     _global_codecs.pop(name, None)
-
-
-def install(storage: Any = None, config: TraceSeedConfig | None = None) -> None:
-    global _installed, _old_excepthook, _old_thread_excepthook
-
-    if _installed:
-        return
-
-    cfg = config
-    stor = storage
-
-    def _sys_excepthook(exc_type: type, exc_value: BaseException, exc_tb: Any) -> None:
-        try:
-            capture_exception(exc_value, config=cfg, storage=stor)
-        except Exception:
-            pass
-        sys.__excepthook__(exc_type, exc_value, exc_tb)
-
-    def _thread_excepthook(args: threading.ExceptHookArgs) -> None:
-        if args.exc_value is not None:
-            try:
-                capture_exception(args.exc_value, config=cfg, storage=stor)
-            except Exception:
-                pass
-
-    _old_excepthook = sys.excepthook
-    _old_thread_excepthook = threading.excepthook
-
-    sys.excepthook = _sys_excepthook
-    threading.excepthook = _thread_excepthook
-    _installed = True
-
-
-def uninstall() -> None:
-    global _installed, _old_excepthook, _old_thread_excepthook
-
-    if not _installed:
-        return
-
-    if _old_excepthook is not None:
-        sys.excepthook = _old_excepthook
-    if _old_thread_excepthook is not None:
-        threading.excepthook = _old_thread_excepthook
-
-    _old_excepthook = None
-    _old_thread_excepthook = None
-    _installed = False

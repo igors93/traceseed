@@ -7,7 +7,6 @@ import os
 import platform
 import sys
 import threading
-import traceback as _traceback
 from typing import Any, Protocol
 
 from ..config import TraceSeedConfig
@@ -51,11 +50,13 @@ class CollectorRegistry:
                 if isinstance(result, dict):
                     extensions.update(result)
             except Exception as exc:
-                errors.append({
-                    "collector": collector.name,
-                    "error": type(exc).__name__,
-                    "message": str(exc),
-                })
+                errors.append(
+                    {
+                        "collector": collector.name,
+                        "error": type(exc).__name__,
+                        "message": str(exc),
+                    }
+                )
         return extensions, errors
 
 
@@ -67,8 +68,7 @@ def build_exception_info(exc: BaseException) -> ExceptionInfo:
         else None
     )
     children = tuple(
-        build_exception_info(child)
-        for child in getattr(exc, "exceptions", None) or []
+        build_exception_info(child) for child in getattr(exc, "exceptions", None) or []
     )
     notes = tuple(getattr(exc, "__notes__", None) or [])
     return ExceptionInfo(
@@ -84,7 +84,9 @@ def build_exception_info(exc: BaseException) -> ExceptionInfo:
     )
 
 
-def build_frames(exc: BaseException, config: TraceSeedConfig, redactor: Any = None) -> tuple[FrameInfo, ...]:
+def build_frames(
+    exc: BaseException, config: TraceSeedConfig, redactor: Any = None
+) -> tuple[FrameInfo, ...]:
     frames: list[FrameInfo] = []
     tb = exc.__traceback__
     while tb is not None:
@@ -99,14 +101,16 @@ def build_frames(exc: BaseException, config: TraceSeedConfig, redactor: Any = No
         else:
             locals_data = {}
 
-        frames.append(FrameInfo(
-            filename=filename,
-            function=frame.f_code.co_name,
-            line_number=lineno,
-            module=frame.f_globals.get("__name__"),
-            source_line=source,
-            locals=locals_data,
-        ))
+        frames.append(
+            FrameInfo(
+                filename=filename,
+                function=frame.f_code.co_name,
+                line_number=lineno,
+                module=frame.f_globals.get("__name__"),
+                source_line=source,
+                locals=locals_data,
+            )
+        )
         tb = tb.tb_next
 
     return tuple(frames[: config.max_frames])

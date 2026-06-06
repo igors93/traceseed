@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import enum
 import json
-from dataclasses import asdict, fields, is_dataclass
+from dataclasses import fields, is_dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -22,8 +22,8 @@ class ValueCodec(Protocol):
     type_name: str
 
     def can_encode(self, value: Any) -> bool: ...
-    def encode(self, value: Any, serializer: "SafeSerializer") -> Any: ...
-    def decode(self, value: Any, serializer: "SafeSerializer") -> Any: ...
+    def encode(self, value: Any, serializer: SafeSerializer) -> Any: ...
+    def decode(self, value: Any, serializer: SafeSerializer) -> Any: ...
 
 
 class SafeSerializer:
@@ -139,16 +139,16 @@ class SafeSerializer:
                     "truncated": len(value) > len(items),
                 }
             if is_dataclass(value) and not isinstance(value, type):
-                data = {}
+                dc_fields: dict[str, Any] = {}
                 for item in fields(value)[: self.config.max_collection_items]:
-                    data[item.name] = self._encode(
+                    dc_fields[item.name] = self._encode(
                         getattr(value, item.name), depth=depth + 1, seen=seen
                     )
                 return {
                     _TYPE: "dataclass",
                     "module": value.__class__.__module__,
                     "class": value.__class__.__qualname__,
-                    "fields": data,
+                    "fields": dc_fields,
                 }
             return {
                 _TYPE: "unresolved",
@@ -192,11 +192,15 @@ class SafeSerializer:
             return {"nan": float("nan"), "inf": float("inf"), "-inf": float("-inf")}[value["value"]]
         if kind == "dict":
             return {
-                self.decode(k, allow_imports=allow_imports): self.decode(v, allow_imports=allow_imports)
+                self.decode(k, allow_imports=allow_imports): self.decode(
+                    v, allow_imports=allow_imports
+                )
                 for k, v in value.get("items", [])
             }
         if kind in {"list", "tuple", "set", "frozenset"}:
-            items = [self.decode(item, allow_imports=allow_imports) for item in value.get("items", [])]
+            items = [
+                self.decode(item, allow_imports=allow_imports) for item in value.get("items", [])
+            ]
             return {"list": list, "tuple": tuple, "set": set, "frozenset": frozenset}[kind](items)
         if kind in {"circular_reference", "max_depth", "unresolved", "codec_error"}:
             raise SerializationError(f"valor do tipo {kind!r} não pode ser reconstruído")
@@ -207,8 +211,7 @@ class SafeSerializer:
             if kind == "enum":
                 return target[value["name"]]
             decoded_fields = {
-                key: self.decode(item, allow_imports=True)
-                for key, item in value["fields"].items()
+                key: self.decode(item, allow_imports=True) for key, item in value["fields"].items()
             }
             return target(**decoded_fields)
         raise SerializationError(f"tipo serializado desconhecido: {kind}")

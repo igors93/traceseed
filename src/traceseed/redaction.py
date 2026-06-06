@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
-from dataclasses import is_dataclass, fields
-from typing import Any, Callable
+from collections.abc import Callable, Mapping
+from dataclasses import fields, is_dataclass
+from typing import Any
 
 from .config import TraceSeedConfig
 
@@ -56,7 +56,9 @@ class Redactor:
             text = bytes(value).decode("utf-8", errors="replace")
             return self._redact_text(text)
 
-        track_identity = isinstance(value, (Mapping, list, tuple, set, frozenset)) or is_dataclass(value)
+        track_identity = isinstance(value, (Mapping, list, tuple, set, frozenset)) or is_dataclass(
+            value
+        )
         identity = id(value)
         if track_identity:
             if identity in seen:
@@ -68,7 +70,9 @@ class Redactor:
                 output: dict[str, Any] = {}
                 for index, (item_key, item_value) in enumerate(value.items()):
                     if index >= self.config.max_collection_items:
-                        output[TRUNCATED] = len(value) - index if hasattr(value, "__len__") else True
+                        output[TRUNCATED] = (
+                            len(value) - index if hasattr(value, "__len__") else True
+                        )
                         break
                     key_text = str(item_key)
                     output[key_text] = self._redact(
@@ -101,7 +105,6 @@ class Redactor:
         finally:
             if track_identity:
                 seen.discard(identity)
-
 
     def redact_encoded(self, value: Any, key: str | None = None) -> Any:
         """Sanitiza uma árvore já produzida por ``SafeSerializer``.
@@ -136,9 +139,7 @@ class Redactor:
             sanitized_items = []
             for pair in value["items"][: self.config.max_collection_items]:
                 if not isinstance(pair, list) or len(pair) != 2:
-                    sanitized_items.append(
-                        self._redact_encoded(pair, key=None, depth=depth + 1)
-                    )
+                    sanitized_items.append(self._redact_encoded(pair, key=None, depth=depth + 1))
                     continue
                 encoded_key, encoded_value = pair
                 plain_key = encoded_key if isinstance(encoded_key, str) else None
@@ -155,15 +156,64 @@ class Redactor:
             output["items"] = sanitized_items
             return output
 
-        output: dict[str, Any] = {}
+        plain: dict[str, Any] = {}
         for item_key, item_value in list(value.items())[: self.config.max_collection_items]:
             item_key_text = str(item_key)
-            output[item_key_text] = self._redact_encoded(
+            plain[item_key_text] = self._redact_encoded(
                 item_value,
                 key=item_key_text if item_key_text not in {_TYPE_MARKER, "value"} else key,
                 depth=depth + 1,
             )
-        return output
+        return plain
+
+    # ------------------------------------------------------------------
+    # Sanitização de modelos de domínio
+    # ------------------------------------------------------------------
+
+    def redact_exception_info(
+        self, info: Any, _depth: int = 0, _seen: frozenset | None = None
+    ) -> Any:
+        """Retorna nova ExceptionInfo com campos de texto sanitizados (recursivo, com proteção a ciclos)."""
+        from .models import ExceptionInfo
+
+        if info is None:
+            return None
+        if _seen is None:
+            _seen = frozenset()
+        if _depth > 12 or id(info) in _seen:
+            return info
+        _seen = _seen | {id(info)}
+
+        cause = self.redact_exception_info(info.cause, _depth + 1, _seen) if info.cause else None
+        ctx = self.redact_exception_info(info.context, _depth + 1, _seen) if info.context else None
+        children = tuple(self.redact_exception_info(c, _depth + 1, _seen) for c in info.children)
+        return ExceptionInfo(
+            module=info.module,
+            type_name=info.type_name,
+            message=self._redact_text(info.message),
+            representation=self._redact_text(info.representation),
+            cause=cause,
+            context=ctx,
+            suppress_context=info.suppress_context,
+            notes=tuple(self._redact_text(n) for n in info.notes),
+            children=children,
+        )
+
+    def redact_breadcrumb(self, b: Any) -> Any:
+        """Retorna novo Breadcrumb com message e data sanitizados."""
+        from .models import Breadcrumb
+
+        return Breadcrumb(
+            timestamp=b.timestamp,
+            category=b.category,
+            message=self._redact_text(b.message),
+            data={k: self.redact(v, key=k) for k, v in b.data.items()},
+            level=b.level,
+        )
+
+    def redact_text(self, text: str) -> str:
+        """Exposição pública de _redact_text para uso externo."""
+        return self._redact_text(text)
 
     def _is_sensitive_key(self, key: str) -> bool:
         normalized = key.casefold().replace("-", "_").replace(" ", "_")

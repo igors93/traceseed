@@ -1,4 +1,14 @@
-"""Geração de fingerprints normalizadas e estáveis para exceções."""
+"""Geração de fingerprints normalizadas, estáveis e versionadas.
+
+Versão do algoritmo: 1
+Campos incluídos: exception_module, exception_type, message (normalizada),
+                  cause_type (tipo da causa imediata), frames (filename+function).
+
+Mudanças que exigem incremento de algorithm_version:
+- adição/remoção de campos no canonical
+- mudança nas regras de normalização
+- mudança na política de frames (ex.: incluir linha)
+"""
 
 from __future__ import annotations
 
@@ -6,10 +16,17 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
 
 from .config import TraceSeedConfig
 from .models import ExceptionInfo, FrameInfo
+
+_ALGORITHM = "traceseed"
+_ALGORITHM_VERSION = 1
+
+# Número de caracteres do digest SHA-256 (32 = 128 bits — suficiente para identificação)
+_DIGEST_LENGTH = 32
 
 _RE_UUID = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
@@ -42,13 +59,21 @@ class Fingerprinter:
         else:
             message = exception.message
 
+        # Inclui apenas o tipo da causa imediata para estabilidade
+        cause_type: str | None = None
+        if exception.cause is not None:
+            cause_type = f"{exception.cause.module}.{exception.cause.type_name}"
+
         canonical: dict[str, Any] = {
+            "algorithm": _ALGORITHM,
+            "algorithm_version": _ALGORITHM_VERSION,
             "exception_module": exception.module,
             "exception_type": exception.type_name,
             "message": message,
+            "cause_type": cause_type,
             "frames": [
                 {
-                    "filename": self._shorten_path(frame.filename),
+                    "filename": self._normalize_path(frame.filename),
                     "function": frame.function,
                 }
                 for frame in selected
@@ -56,7 +81,7 @@ class Fingerprinter:
         }
         digest = hashlib.sha256(
             json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()[:32]
+        ).hexdigest()[:_DIGEST_LENGTH]
         return FingerprintDetails(value=digest, canonical=canonical)
 
     def normalize_message(self, message: str) -> str:
@@ -67,5 +92,14 @@ class Fingerprinter:
         return text
 
     @staticmethod
-    def _shorten_path(path: str) -> str:
-        return path.lstrip("/")
+    def _normalize_path(path: str) -> str:
+        """Converte para posix relativo (sem raiz), compatível com Windows e Unix."""
+        try:
+            parts = PureWindowsPath(path).parts if "\\" in path else PurePosixPath(path).parts
+            # Remove âncora raiz ('/', 'C:\\', etc.)
+            relative = [
+                p for p in parts if p not in ("/", "\\") and not (len(p) == 3 and p[1] == ":")
+            ]
+            return "/".join(relative) if relative else path
+        except Exception:
+            return path.lstrip("/\\")

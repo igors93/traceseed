@@ -2,10 +2,10 @@ import enum
 import math
 import unittest
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from traceseed.config import TraceSeedConfig
 from traceseed.errors import SerializationError
@@ -43,7 +43,7 @@ class SerializationTests(unittest.TestCase):
         self.assertEqual(self.roundtrip(b"abc"), b"abc")
 
     def test_datetime_roundtrip(self):
-        value = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
+        value = datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
         self.assertEqual(self.roundtrip(value), value)
 
     def test_date_roundtrip(self):
@@ -153,9 +153,15 @@ class SerializationTests(unittest.TestCase):
     def test_custom_codec(self):
         class ComplexCodec:
             type_name = "complex"
-            def can_encode(self, value): return isinstance(value, complex)
-            def encode(self, value, serializer): return [value.real, value.imag]
-            def decode(self, value, serializer): return complex(*value)
+
+            def can_encode(self, value):
+                return isinstance(value, complex)
+
+            def encode(self, value, serializer):
+                return [value.real, value.imag]
+
+            def decode(self, value, serializer):
+                return complex(*value)
 
         self.serializer.register_codec(ComplexCodec())
         self.assertEqual(self.roundtrip(2 + 3j), 2 + 3j)
@@ -163,5 +169,6 @@ class SerializationTests(unittest.TestCase):
     def test_codec_requires_type_name(self):
         class InvalidCodec:
             pass
+
         with self.assertRaises(ValueError):
             self.serializer.register_codec(InvalidCodec())

@@ -8,12 +8,30 @@ from typing import Any
 
 from .errors import ConfigurationError
 
-_DEFAULT_REDACT_FIELDS = frozenset({
-    "password", "passwd", "secret", "token", "api_key", "apikey",
-    "access_token", "refresh_token", "private_key", "authorization",
-    "auth", "credential", "credentials", "ssn", "cpf", "cnpj",
-    "credit_card", "card_number", "cvv", "pin",
-})
+_DEFAULT_REDACT_FIELDS = frozenset(
+    {
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "private_key",
+        "authorization",
+        "auth",
+        "credential",
+        "credentials",
+        "ssn",
+        "cpf",
+        "cnpj",
+        "credit_card",
+        "card_number",
+        "cvv",
+        "pin",
+    }
+)
 
 _DEFAULT_REDACT_PATTERNS = (
     r"Bearer\s+\S+",
@@ -38,6 +56,12 @@ class TraceSeedConfig:
     re_raise: bool = True
     include_package_hashes: bool = True
     write_pretty_json: bool = True
+    # Limites de segurança para leitura de arquivos .tseed
+    max_archive_files: int = 256
+    max_archive_file_size: int = 50 * 1024 * 1024  # 50 MB descompactado por arquivo
+    max_archive_total_size: int = 200 * 1024 * 1024  # 200 MB total descompactado
+    max_compression_ratio: int = 200  # razão suspeita de compressão
+    max_manifest_size: int = 512 * 1024  # 512 KB para manifest.json
 
     def __post_init__(self) -> None:
         if isinstance(self.output_directory, str):
@@ -68,15 +92,12 @@ class TraceSeedConfig:
         if not self.filename_prefix.strip():
             raise ConfigurationError("filename_prefix não pode ser vazio ou só espaços")
 
-    def with_overrides(self, **kwargs: Any) -> "TraceSeedConfig":
-        fields = {
-            f.name: getattr(self, f.name)
-            for f in self.__dataclass_fields__.values()  # type: ignore[attr-defined]
-        }
+    def with_overrides(self, **kwargs: Any) -> TraceSeedConfig:
+        fields = {f.name: getattr(self, f.name) for f in self.__dataclass_fields__.values()}
         fields.update(kwargs)
         return TraceSeedConfig(**fields)
 
-    def with_redact_fields(self, extra: list[str]) -> "TraceSeedConfig":
+    def with_redact_fields(self, extra: list[str]) -> TraceSeedConfig:
         new_fields = self.redact_fields | frozenset(f.casefold() for f in extra)
         return self.with_overrides(redact_fields=new_fields)
 

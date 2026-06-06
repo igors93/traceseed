@@ -2,20 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from datetime import datetime, timezone
-from typing import Any, Generator
+from datetime import UTC, datetime
+from typing import Any
 
 from .models import Breadcrumb
 
-_ctx_var: ContextVar[dict[str, Any]] = ContextVar("traceseed_context", default={})
+_ctx_var: ContextVar[dict[str, Any] | None] = ContextVar("traceseed_context", default=None)
 _crumbs_var: ContextVar[tuple[Breadcrumb, ...]] = ContextVar("traceseed_breadcrumbs", default=())
 
 
 @contextmanager
 def context(**kwargs: Any) -> Generator[None, None, None]:
-    token = _ctx_var.set({**_ctx_var.get(), **kwargs})
+    token = _ctx_var.set({**(_ctx_var.get() or {}), **kwargs})
     try:
         yield
     finally:
@@ -23,13 +24,13 @@ def context(**kwargs: Any) -> Generator[None, None, None]:
 
 
 def current_context() -> dict[str, Any]:
-    return dict(_ctx_var.get())
+    return dict(_ctx_var.get() or {})
 
 
 def set_context(key: str, value: Any) -> Token:
     if not key:
         raise ValueError("key não pode ser vazia")
-    new = {**_ctx_var.get(), key: value}
+    new = {**(_ctx_var.get() or {}), key: value}
     return _ctx_var.set(new)
 
 
@@ -48,8 +49,9 @@ def breadcrumb(category: str, message: str, **data: Any) -> Breadcrumb:
     if not message.strip():
         raise ValueError("message não pode ser vazia")
     from .config import get_config
+
     item = Breadcrumb(
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
         category=category,
         message=message,
         data=data,

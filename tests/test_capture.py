@@ -1,16 +1,13 @@
 import asyncio
 import io
-import os
 import sys
-import tempfile
 import threading
 import unittest
 from contextlib import redirect_stderr
-from pathlib import Path
 
 from traceseed import (
-    TraceSeedConfig,
     MemoryStorage,
+    TraceSeedConfig,
     breadcrumb,
     capture,
     capture_exception,
@@ -33,18 +30,21 @@ from traceseed.models import CaptureContext
 
 class FailingStorage:
     name = "broken"
+
     def save(self, record, extra=None):
         raise OSError("disk unavailable")
 
 
 class CustomCollector:
     name = "custom"
+
     def collect(self, exception, context, config):
         return {"custom_value": 42}
 
 
 class BrokenCollector:
     name = "broken"
+
     def collect(self, exception, context, config):
         raise RuntimeError("collector failed")
 
@@ -130,7 +130,6 @@ class CaptureTests(unittest.TestCase):
     def test_capture_locals_disabled_by_default(self):
         storage = MemoryStorage()
         try:
-            local_secret = "x"
             raise ValueError("x")
         except ValueError as error:
             capture_exception(error, storage=storage)
@@ -140,24 +139,25 @@ class CaptureTests(unittest.TestCase):
         storage = MemoryStorage()
         config = TraceSeedConfig(capture_locals=True)
         try:
-            local_value = 123
+            local_value = 123  # noqa: F841 — captured via frame locals
             raise ValueError("x")
         except ValueError as error:
             capture_exception(error, storage=storage, config=config)
-        self.assertTrue(any(frame.locals.get("local_value") == 123 for frame in storage.records[0].frames))
+        self.assertTrue(
+            any(frame.locals.get("local_value") == 123 for frame in storage.records[0].frames)
+        )
 
     def test_guard_reraises(self):
         storage = MemoryStorage()
-        with self.assertRaises(ZeroDivisionError):
-            with guard("division", storage=storage):
-                1 / 0
+        with self.assertRaises(ZeroDivisionError), guard("division", storage=storage):
+            1 / 0  # noqa: B018
         self.assertEqual(storage.records[0].operation, "division")
 
     def test_guard_can_suppress(self):
         storage = MemoryStorage()
         config = TraceSeedConfig(re_raise=False)
         with guard("division", storage=storage, config=config):
-            1 / 0
+            1 / 0  # noqa: B018
         self.assertEqual(len(storage.records), 1)
 
     def test_decorator_can_suppress(self):
@@ -218,7 +218,6 @@ class CaptureTests(unittest.TestCase):
     def test_capture_exception_rejects_non_exception(self):
         with self.assertRaises(TypeError):
             capture_exception("wrong")
-
 
     def test_keyboard_interrupt_is_not_captured_or_suppressed(self):
         storage = MemoryStorage()
@@ -342,18 +341,16 @@ class CaptureTests(unittest.TestCase):
             fail("x")
         self.assertFalse(storage.records[0].callable_info.replayable)
 
-
-
     def test_replay_payload_redacts_nested_sensitive_values(self):
         storage = MemoryStorage()
         try:
             raise RuntimeError("x")
         except RuntimeError as error:
-            result = capture_exception(
+            capture_exception(
                 error,
-                callable_info=__import__("traceseed.models", fromlist=["CallableInfo"]).CallableInfo(
-                    "tests.replay_targets", "add", True
-                ),
+                callable_info=__import__(
+                    "traceseed.models", fromlist=["CallableInfo"]
+                ).CallableInfo("tests.replay_targets", "add", True),
                 replay_arguments=({"password": "secret", "value": 2},),
                 replay_keyword_arguments={},
                 storage=storage,
@@ -369,9 +366,15 @@ class CaptureTests(unittest.TestCase):
 
         class BoxCodec:
             type_name = "box"
-            def can_encode(self, value): return isinstance(value, Box)
-            def encode(self, value, serializer): return value.value
-            def decode(self, value, serializer): return Box(value)
+
+            def can_encode(self, value):
+                return isinstance(value, Box)
+
+            def encode(self, value, serializer):
+                return value.value
+
+            def decode(self, value, serializer):
+                return Box(value)
 
         register_codec(BoxCodec())
         storage = MemoryStorage()
@@ -380,9 +383,9 @@ class CaptureTests(unittest.TestCase):
         except RuntimeError as error:
             result = capture_exception(
                 error,
-                callable_info=__import__("traceseed.models", fromlist=["CallableInfo"]).CallableInfo(
-                    "tests.replay_targets", "add", True
-                ),
+                callable_info=__import__(
+                    "traceseed.models", fromlist=["CallableInfo"]
+                ).CallableInfo("tests.replay_targets", "add", True),
                 replay_arguments=(Box(3),),
                 replay_keyword_arguments={},
                 storage=storage,

@@ -93,7 +93,9 @@ class RedactionTests(unittest.TestCase):
 
     def test_custom_redactor(self):
         marker = object()
-        redactor = Redactor(TraceSeedConfig(), custom=lambda key, value: REDACTED if value is marker else value)
+        redactor = Redactor(
+            TraceSeedConfig(), custom=lambda key, value: REDACTED if value is marker else value
+        )
         self.assertEqual(redactor.redact(marker), REDACTED)
 
 

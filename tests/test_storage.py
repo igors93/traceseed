@@ -4,7 +4,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from traceseed import TraceSeedConfig, MemoryStorage, capture_exception
+from traceseed import MemoryStorage, TraceSeedConfig, capture_exception
 from traceseed.errors import IntegrityError, InvalidPackageError, StorageError
 from traceseed.serialization import SafeSerializer
 from traceseed.storage import ArchiveStorage, DirectoryStorage
@@ -18,7 +18,9 @@ class StorageTests(unittest.TestCase):
         try:
             raise ValueError("customer 123 not found")
         except ValueError as error:
-            result = capture_exception(error, operation="load/customer", config=config, storage=storage, strict=True)
+            result = capture_exception(
+                error, operation="load/customer", config=config, storage=storage, strict=True
+            )
         return result, storage
 
     def test_archive_is_created_with_tseed_extension(self):
@@ -31,7 +33,13 @@ class StorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             result, storage = self.capture_to(tmp)
             files = storage.load_files(result.location)
-            expected = {"manifest.json", "summary.json", "record.json", "traceback.txt", "README.txt"}
+            expected = {
+                "manifest.json",
+                "summary.json",
+                "record.json",
+                "traceback.txt",
+                "README.txt",
+            }
             self.assertTrue(expected.issubset(files))
 
     def test_manifest_can_be_verified(self):
@@ -44,8 +52,15 @@ class StorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             result, storage = self.capture_to(tmp)
             path = Path(result.location)
-            with zipfile.ZipFile(path, "a") as archive:
-                archive.writestr("summary.json", b"{}")
+            # Lê todos os arquivos, modifica summary.json, re-escreve sem duplicatas
+            files = {}
+            with zipfile.ZipFile(path, "r") as archive:
+                for name in archive.namelist():
+                    files[name] = archive.read(name)
+            files["summary.json"] = b"{}"
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for name, content in files.items():
+                    archive.writestr(name, content)
             with self.assertRaises(IntegrityError):
                 storage.verify(path)
 
