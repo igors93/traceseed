@@ -1,35 +1,35 @@
-"""Hierarquia de exceções do TraceSeed."""
+"""TraceSeed exception hierarchy."""
 
 from __future__ import annotations
 
 
 class TraceSeedError(Exception):
-    """Erro-base para todas as exceções do TraceSeed."""
+    """Base class for TraceSeed errors."""
 
 
 class ConfigurationError(TraceSeedError, ValueError):
-    """Configuração inválida ou inconsistente."""
+    """Raised when configuration is invalid or inconsistent."""
 
 
 class SerializationError(TraceSeedError, ValueError):
-    """Falha ao codificar ou decodificar um valor."""
+    """Raised when a value cannot be encoded or decoded safely."""
 
 
 class StorageError(TraceSeedError, OSError):
-    """Falha ao persistir ou carregar um pacote."""
+    """Raised when a package cannot be persisted or loaded."""
 
 
 class IntegrityError(StorageError):
-    """Pacote corrompido ou com hash inválido."""
+    """Raised when a package hash does not match its manifest."""
 
 
 class InvalidPackageError(StorageError):
-    """Pacote malformado ou com formato desconhecido."""
+    """Raised when a diagnostic package is malformed or unsupported."""
 
 
 class ReplayError(TraceSeedError, RuntimeError):
-    """Falha ao inspecionar ou executar um replay."""
+    """Raised when replay inspection or execution is unsafe or invalid."""
 
 
 class CallbackError(TraceSeedError):
-    """Falha no callback on_captured em modo strict=True."""
+    """Raised when an on_captured callback fails in strict mode."""

@@ -1,4 +1,4 @@
-"""Modelos de domínio serializáveis do TraceSeed."""
+"""Serializable domain models used by TraceSeed."""
 
 from __future__ import annotations
 
@@ -67,8 +67,6 @@ class CaptureContext:
     metadata: dict[str, Any] = field(default_factory=dict)
     arguments: dict[str, Any] = field(default_factory=dict)
     callable_info: CallableInfo | None = None
-    # Argumentos brutos de replay — ficam somente em memória durante a captura;
-    # nunca persistidos diretamente em FailureRecord.
     replay_arguments: tuple[Any, ...] | None = None
     replay_keyword_arguments: dict[str, Any] | None = None
 

@@ -50,7 +50,9 @@ def test_missing_replayable_flag_is_rejected_before_import(tmp_path, monkeypatch
 @pytest.mark.parametrize("flag", [1, "true", [], {}])
 def test_replayable_flag_must_be_a_real_boolean(tmp_path, flag):
     payload = _replay_payload(arguments=encoded_list([1]), replayable=flag)
-    package = write_tseed(tmp_path / f"flag-{type(flag).__name__}.tseed", {"replay.json": json.dumps(payload)})
+    package = write_tseed(
+        tmp_path / f"flag-{type(flag).__name__}.tseed", {"replay.json": json.dumps(payload)}
+    )
     with pytest.raises((ReplayError, InvalidPackageError)):
         ReplayRunner().run(package, allow_code_execution=True)
 
@@ -59,7 +61,9 @@ def test_replayable_flag_must_be_a_real_boolean(tmp_path, flag):
 def test_missing_replay_schema_fields_raise_controlled_error(tmp_path, missing_field):
     payload = _replay_payload(arguments=encoded_list([1]))
     payload.pop(missing_field)
-    package = write_tseed(tmp_path / f"missing-{missing_field}.tseed", {"replay.json": json.dumps(payload)})
+    package = write_tseed(
+        tmp_path / f"missing-{missing_field}.tseed", {"replay.json": json.dumps(payload)}
+    )
 
     with pytest.raises((ReplayError, InvalidPackageError)):
         ReplayRunner().run(package, allow_code_execution=True)
@@ -91,7 +95,9 @@ def test_loaded_replay_payload_obeys_configured_size_limit(tmp_path):
 )
 def test_malformed_serialized_arguments_raise_replay_error(tmp_path, encoded_value):
     payload = _replay_payload(arguments=encoded_list([encoded_value]))
-    package = write_tseed(tmp_path / "malformed-argument.tseed", {"replay.json": json.dumps(payload)})
+    package = write_tseed(
+        tmp_path / "malformed-argument.tseed", {"replay.json": json.dumps(payload)}
+    )
 
     with pytest.raises(ReplayError):
         ReplayRunner().run(package, allow_code_execution=True)

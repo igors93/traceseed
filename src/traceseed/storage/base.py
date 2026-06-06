@@ -1,4 +1,4 @@
-"""Contratos e modelos de armazenamento."""
+"""Storage protocols and result models."""
 
 from __future__ import annotations
 
@@ -18,5 +18,10 @@ class StoredFailure:
 class Storage(Protocol):
     name: str
 
-    def save(self, record: FailureRecord, extra: dict[str, Any] | None = None) -> StoredFailure: ...
+    def save(
+        self,
+        record: FailureRecord,
+        extra: dict[str, Any] | None = None,
+    ) -> StoredFailure: ...
+
     def load_files(self, location: str | Path) -> dict[str, bytes]: ...

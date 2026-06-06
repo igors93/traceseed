@@ -15,7 +15,6 @@ from traceseed import (
 
 from ._helpers import make_exception_chain, walk_exception_info
 
-
 SECRET = "Bearer diagnostic-secret-token"
 
 

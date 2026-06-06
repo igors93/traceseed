@@ -107,7 +107,9 @@ def test_generated_archive_hashes_every_payload_member(tmp_path):
     assert payload_names == set(manifest["hashes"])
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not authoritative on Windows")
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX permission bits are not authoritative on Windows"
+)
 def test_generated_archive_is_private_to_owner_by_default(tmp_path):
     config = TraceSeedConfig(output_directory=tmp_path)
     storage = ArchiveStorage(config, SafeSerializer(config))

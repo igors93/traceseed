@@ -58,10 +58,7 @@ def test_non_string_extension_key_is_isolated_to_its_collector():
     assert result.capture_error is None
     assert storage.records
     assert result.record.extensions["good_value"] == 42
-    assert any(
-        error["collector"] == "invalid-key"
-        for error in result.record.collector_errors
-    )
+    assert any(error["collector"] == "invalid-key" for error in result.record.collector_errors)
 
 
 def test_collectors_cannot_silently_overwrite_each_others_results():
@@ -96,7 +93,4 @@ def test_collector_returning_non_dict_is_reported_not_silently_ignored():
 
     assert result.capture_error is None
     assert storage.records
-    assert any(
-        error["collector"] == "invalid-return"
-        for error in result.record.collector_errors
-    )
+    assert any(error["collector"] == "invalid-return" for error in result.record.collector_errors)

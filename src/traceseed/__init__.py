@@ -1,4 +1,4 @@
-"""TraceSeed — captura de falhas sem dependências externas."""
+"""TraceSeed public API."""
 
 from __future__ import annotations
 
@@ -38,6 +38,7 @@ from .errors import (
     StorageError,
     TraceSeedError,
 )
+from .logging import BreadcrumbHandler
 from .models import (
     Breadcrumb,
     CallableInfo,
@@ -52,7 +53,6 @@ from .storage import ArchiveStorage, DirectoryStorage, MemoryStorage, StoredFail
 
 __all__ = [
     "__version__",
-    # api
     "capture",
     "capture_exception",
     "get_last_capture",
@@ -65,7 +65,6 @@ __all__ = [
     "uninstall_asyncio",
     "unregister_codec",
     "unregister_collector",
-    # errors
     "TraceSeedError",
     "CallbackError",
     "ConfigurationError",
@@ -74,12 +73,10 @@ __all__ = [
     "ReplayError",
     "SerializationError",
     "StorageError",
-    # config
     "TraceSeedConfig",
     "configure",
     "get_config",
     "reset_config",
-    # context
     "breadcrumb",
     "clear_context",
     "context",
@@ -87,7 +84,7 @@ __all__ = [
     "current_context",
     "reset_context",
     "set_context",
-    # models
+    "BreadcrumbHandler",
     "Breadcrumb",
     "CallableInfo",
     "CaptureContext",
@@ -96,7 +93,6 @@ __all__ = [
     "FailureRecord",
     "FrameInfo",
     "RuntimeInfo",
-    # storage
     "ArchiveStorage",
     "DirectoryStorage",
     "MemoryStorage",

@@ -1,4 +1,4 @@
-"""Storage em memória para testes e integrações."""
+"""In-memory storage for tests and integrations."""
 
 from __future__ import annotations
 
@@ -15,10 +15,17 @@ class MemoryStorage:
         self.records: list[FailureRecord] = []
         self.extras: list[dict[str, Any]] = []
 
-    def save(self, record: FailureRecord, extra: dict[str, Any] | None = None) -> StoredFailure:
+    def save(
+        self,
+        record: FailureRecord,
+        extra: dict[str, Any] | None = None,
+    ) -> StoredFailure:
         self.records.append(record)
         self.extras.append(dict(extra or {}))
-        return StoredFailure(location=f"memory://{record.incident_id}", storage_name=self.name)
+        return StoredFailure(
+            location=f"memory://{record.incident_id}",
+            storage_name=self.name,
+        )
 
     def load_files(self, location: str) -> dict[str, bytes]:
-        raise NotImplementedError("MemoryStorage armazena modelos, não arquivos")
+        raise NotImplementedError("MemoryStorage stores models, not package files")

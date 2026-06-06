@@ -1,13 +1,4 @@
-"""Pacote .tseed em ZIP, com manifesto e hashes de integridade.
-
-Garantias de segurança:
-- ZIP bomb: metadados verificados ANTES de qualquer leitura de conteúdo.
-- Caminhos: absolutos, traversal, diretórios e nomes vazios são rejeitados.
-- Entradas: symlinks, diretórios, arquivos criptografados e compressões não
-  permitidas são rejeitados por metadados antes de qualquer extração.
-- Manifesto: validação integral (formato, versão, files == hashes, sem extras).
-- Integridade: SHA-256 verificado após extração.
-"""
+"""Versioned .tseed ZIP storage with strict integrity and resource limits."""
 
 from __future__ import annotations
 
@@ -15,10 +6,11 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 import zipfile
 from contextlib import suppress
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 from ..config import TraceSeedConfig
@@ -28,15 +20,12 @@ from ..serialization import SafeSerializer
 from .base import StoredFailure
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+_WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 _REQUIRED_MANIFEST_FIELDS = frozenset(
     {"format", "format_version", "library_version", "files", "hashes"}
 )
 _VALID_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
-
-# Compressões permitidas: STORED e DEFLATED
 _ALLOWED_COMPRESSION = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
-
-# Versões de formato suportadas
 _SUPPORTED_FORMAT_VERSIONS = frozenset({1})
 
 
@@ -47,12 +36,16 @@ class ArchiveStorage:
         self.config = config
         self.serializer = serializer
 
-    def save(self, record: FailureRecord, extra: dict[str, Any] | None = None) -> StoredFailure:
+    def save(
+        self,
+        record: FailureRecord,
+        extra: dict[str, Any] | None = None,
+    ) -> StoredFailure:
         directory = self.config.output_directory
         try:
-            directory.mkdir(parents=True, exist_ok=True)
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         except OSError as error:
-            raise StorageError(f"não foi possível criar {directory}: {error}") from error
+            raise StorageError(f"unable to create {directory}: {error}") from error
 
         files = self._build_files(record, extra or {})
         hashes = {name: hashlib.sha256(content).hexdigest() for name, content in files.items()}
@@ -65,257 +58,204 @@ class ArchiveStorage:
             "created_at": record.created_at.isoformat(),
             "operation": record.operation,
             "files": sorted(files),
-            "hashes": hashes if self.config.include_package_hashes else {},
+            "hashes": hashes,
         }
         files["manifest.json"] = self._json_bytes(manifest)
 
-        filename = self._filename(record)
-        target = directory / filename
+        target = directory / self._filename(record)
         temporary: Path | None = None
         try:
-            fd, temp_name = tempfile.mkstemp(prefix=".traceseed-", suffix=".tmp", dir=directory)
-            os.close(fd)
-            temporary = Path(temp_name)
-            with zipfile.ZipFile(temporary, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".traceseed-",
+                suffix=".tmp",
+                dir=directory,
+            )
+            os.close(descriptor)
+            temporary = Path(temporary_name)
+            os.chmod(temporary, 0o600)
+            with zipfile.ZipFile(
+                temporary,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+            ) as archive:
                 for name in sorted(files):
                     info = zipfile.ZipInfo(name)
                     info.date_time = (1980, 1, 1, 0, 0, 0)
                     info.compress_type = zipfile.ZIP_DEFLATED
-                    info.external_attr = 0o600 << 16
+                    info.external_attr = (stat.S_IFREG | 0o600) << 16
                     archive.writestr(info, files[name])
             os.replace(temporary, target)
+            os.chmod(target, 0o600)
             return StoredFailure(location=str(target), storage_name=self.name)
-        except OSError as error:
-            raise StorageError(f"não foi possível salvar pacote: {error}") from error
+        except (OSError, zipfile.BadZipFile) as error:
+            raise StorageError(f"unable to save package: {error}") from error
         finally:
             if temporary is not None and temporary.exists():
                 with suppress(OSError):
                     temporary.unlink()
 
     def load_files(self, location: str | Path) -> dict[str, bytes]:
-        """Lê arquivo .tseed com proteção contra ZIP bomb e entradas inseguras.
-
-        Ordem de verificação (NUNCA lê conteúdo antes das verificações de metadados):
-        1. Abre o ZIP e lê somente ZipInfo (metadados)
-        2. Valida quantidade de entradas
-        3. Valida nomes e caminhos (absolutos, traversal, vazio)
-        4. Rejeita entradas duplicadas
-        5. Rejeita tipos inseguros (diretórios, symlinks, criptografados, compressão estranha)
-        6. Valida tamanho individual por metadados
-        7. Valida tamanho total por metadados
-        8. Valida razão de compressão por metadados
-        9. Valida tamanho do manifesto por metadados
-        10. Somente então lê o conteúdo (com limite real de bytes)
-        """
         path = Path(location)
-        cfg = self.config
+        config = self.config
         try:
             with zipfile.ZipFile(path, "r") as archive:
                 infos = archive.infolist()
-
-                # 1. Número de entradas
-                if len(infos) > cfg.max_archive_files:
+                if len(infos) > config.max_archive_files:
                     raise InvalidPackageError(
-                        f"pacote contém {len(infos)} arquivos (limite: {cfg.max_archive_files})"
+                        f"package contains {len(infos)} files; limit is {config.max_archive_files}"
                     )
 
-                # 2. Nomes e caminhos inseguros
+                seen: set[str] = set()
+                total_metadata_size = 0
                 for info in infos:
-                    name = info.filename
-                    if not name:
-                        raise InvalidPackageError("entrada ZIP com nome vazio")
-                    if name.startswith("/") or name.startswith("\\"):
-                        raise InvalidPackageError(f"caminho absoluto no pacote: {name!r}")
-                    if name.startswith("C:") or name.startswith("c:"):
-                        raise InvalidPackageError(f"caminho absoluto Windows no pacote: {name!r}")
-                    if ".." in Path(name).parts:
-                        raise InvalidPackageError(f"caminho com '..' no pacote: {name!r}")
-
-                # 3. Entradas duplicadas
-                seen_names: set[str] = set()
-                for info in infos:
-                    if info.filename in seen_names:
-                        raise InvalidPackageError(f"entrada duplicada no ZIP: {info.filename!r}")
-                    seen_names.add(info.filename)
-
-                # 4. Tipos inseguros (antes de qualquer leitura)
-                for info in infos:
-                    name = info.filename
-                    # Diretórios (nome termina com '/')
-                    if name.endswith("/"):
-                        raise InvalidPackageError(f"diretório não permitido no pacote: {name!r}")
-                    # Arquivos criptografados (flag bit 0)
-                    if info.flag_bits & 0x1:
-                        raise InvalidPackageError(f"arquivo criptografado não suportado: {name!r}")
-                    # Compressão não permitida
-                    if info.compress_type not in _ALLOWED_COMPRESSION:
+                    name = self._validate_member_name(info.filename)
+                    if name in seen:
+                        raise InvalidPackageError(f"duplicate ZIP entry: {name!r}")
+                    seen.add(name)
+                    self._validate_member_type(info)
+                    if info.file_size > config.max_archive_file_size:
+                        raise InvalidPackageError(f"{name!r} exceeds the per-file size limit")
+                    if info.file_size > 0 and info.compress_size == 0:
+                        raise InvalidPackageError(f"{name!r} has invalid compressed size metadata")
+                    if (
+                        info.compress_size > 0
+                        and info.file_size / info.compress_size > config.max_compression_ratio
+                    ):
+                        raise InvalidPackageError(f"{name!r} exceeds the compression ratio limit")
+                    total_metadata_size += info.file_size
+                    if total_metadata_size > config.max_archive_total_size:
                         raise InvalidPackageError(
-                            f"método de compressão não permitido em {name!r}: {info.compress_type}"
+                            "package exceeds the total uncompressed size limit"
                         )
-                    # Symlinks Unix: external_attr contém modo Unix nos bits altos
-                    unix_mode = (info.external_attr >> 16) & 0o170000
-                    if unix_mode == 0o120000:
-                        raise InvalidPackageError(f"symlink não permitido no pacote: {name!r}")
+                    if name == "manifest.json" and info.file_size > config.max_manifest_size:
+                        raise InvalidPackageError("manifest.json exceeds its size limit")
 
-                # 5. Tamanho individual e razão de compressão (por metadados)
-                for info in infos:
-                    uncompressed = info.file_size
-                    compressed = info.compress_size
-                    if uncompressed > cfg.max_archive_file_size:
-                        raise InvalidPackageError(
-                            f"{info.filename!r}: arquivo descompactado muito grande "
-                            f"({uncompressed} bytes, limite: {cfg.max_archive_file_size})"
-                        )
-                    if compressed > 0 and uncompressed / compressed > cfg.max_compression_ratio:
-                        raise InvalidPackageError(
-                            f"{info.filename!r}: razão de compressão suspeita "
-                            f"({uncompressed}/{compressed})"
-                        )
-
-                # 6. Tamanho total descompactado
-                total_uncompressed = sum(info.file_size for info in infos)
-                if total_uncompressed > cfg.max_archive_total_size:
-                    raise InvalidPackageError(
-                        f"tamanho total descompactado excede limite: "
-                        f"{total_uncompressed} bytes (limite: {cfg.max_archive_total_size})"
-                    )
-
-                # 7. Tamanho especial do manifesto
-                manifest_info = next((i for i in infos if i.filename == "manifest.json"), None)
-                if manifest_info and manifest_info.file_size > cfg.max_manifest_size:
-                    raise InvalidPackageError(
-                        f"manifest.json muito grande: {manifest_info.file_size} bytes "
-                        f"(limite: {cfg.max_manifest_size})"
-                    )
-
-                # 8. Leitura com limite real de bytes (detecta cabeçalhos mentirosos)
                 result: dict[str, bytes] = {}
+                total_actual_size = 0
                 for info in infos:
-                    limit = cfg.max_archive_file_size
-                    with archive.open(info.filename) as fobj:
-                        data = fobj.read(limit + 1)
+                    name = self._validate_member_name(info.filename)
+                    limit = (
+                        config.max_manifest_size
+                        if name == "manifest.json"
+                        else config.max_archive_file_size
+                    )
+                    with archive.open(info, "r") as stream:
+                        data = stream.read(limit + 1)
                     if len(data) > limit:
-                        raise InvalidPackageError(
-                            f"{info.filename!r}: conteúdo real excede limite ({limit} bytes)"
-                        )
-                    result[info.filename] = data
-
+                        raise InvalidPackageError(f"{name!r} exceeds its actual size limit")
+                    total_actual_size += len(data)
+                    if total_actual_size > config.max_archive_total_size:
+                        raise InvalidPackageError("package exceeds the actual total size limit")
+                    result[name] = data
                 return result
-
         except zipfile.BadZipFile as error:
-            raise InvalidPackageError("arquivo não é um pacote .tseed válido") from error
+            raise InvalidPackageError("file is not a valid .tseed package") from error
         except (IntegrityError, InvalidPackageError):
             raise
         except OSError as error:
             raise InvalidPackageError(str(error)) from error
 
+    @staticmethod
+    def _validate_member_name(raw_name: str) -> str:
+        if not isinstance(raw_name, str) or not raw_name or "\x00" in raw_name:
+            raise InvalidPackageError("ZIP entry has an invalid name")
+        normalized = raw_name.replace("\\", "/")
+        if normalized.startswith(("/", "//")) or _WINDOWS_DRIVE.match(normalized):
+            raise InvalidPackageError(f"absolute path in package: {raw_name!r}")
+        parts = PurePosixPath(normalized).parts
+        if not parts or any(part in {"", ".", ".."} for part in parts):
+            raise InvalidPackageError(f"unsafe path in package: {raw_name!r}")
+        canonical = "/".join(parts)
+        if canonical != normalized:
+            raise InvalidPackageError(f"non-canonical path in package: {raw_name!r}")
+        return canonical
+
+    @staticmethod
+    def _validate_member_type(info: zipfile.ZipInfo) -> None:
+        name = info.filename
+        if name.endswith("/") or info.is_dir():
+            raise InvalidPackageError(f"directories are not allowed: {name!r}")
+        if info.flag_bits & 0x1:
+            raise InvalidPackageError(f"encrypted entries are not supported: {name!r}")
+        if info.compress_type not in _ALLOWED_COMPRESSION:
+            raise InvalidPackageError(f"unsupported compression method for {name!r}")
+        unix_mode = (info.external_attr >> 16) & 0o170000
+        if unix_mode and unix_mode != stat.S_IFREG:
+            raise InvalidPackageError(f"non-regular ZIP entry is not allowed: {name!r}")
+
     def verify_files(self, files: dict[str, bytes]) -> dict[str, Any]:
-        """Valida manifesto e hashes a partir de um dict já carregado.
-
-        Esta é a implementação central de validação — deve ser reutilizada
-        por qualquer código que precise verificar um pacote .tseed.
-        """
+        if not isinstance(files, dict) or not all(
+            isinstance(name, str) and isinstance(content, bytes) for name, content in files.items()
+        ):
+            raise InvalidPackageError("package files must be a string-to-bytes mapping")
         if "manifest.json" not in files:
-            raise InvalidPackageError("manifest.json ausente")
-
+            raise InvalidPackageError("manifest.json is missing")
         try:
-            raw_manifest = json.loads(files["manifest.json"].decode("utf-8"))
+            manifest_value = json.loads(files["manifest.json"].decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise InvalidPackageError("manifest.json inválido") from error
+            raise InvalidPackageError("manifest.json is invalid") from error
+        if not isinstance(manifest_value, dict):
+            raise InvalidPackageError("manifest.json must contain a JSON object")
+        manifest = manifest_value
 
-        if not isinstance(raw_manifest, dict):
-            raise InvalidPackageError("manifest.json deve ser um objeto JSON")
-
-        manifest = raw_manifest
-
-        # Campos obrigatórios
-        missing = _REQUIRED_MANIFEST_FIELDS - set(manifest.keys())
-        if missing:
-            raise InvalidPackageError(f"manifest.json faltam campos: {sorted(missing)}")
-
+        missing_fields = _REQUIRED_MANIFEST_FIELDS - set(manifest)
+        if missing_fields:
+            raise InvalidPackageError(f"manifest.json is missing fields: {sorted(missing_fields)}")
         if manifest.get("format") != "traceseed":
-            raise InvalidPackageError(f"formato desconhecido: {manifest.get('format')!r}")
+            raise InvalidPackageError("unknown package format")
+        format_version = manifest.get("format_version")
+        if not isinstance(format_version, int) or isinstance(format_version, bool):
+            raise InvalidPackageError("format_version must be an integer, not bool")
+        if format_version not in _SUPPORTED_FORMAT_VERSIONS:
+            raise InvalidPackageError(f"unsupported format_version: {format_version!r}")
+        library_version = manifest.get("library_version")
+        if not isinstance(library_version, str) or not library_version.strip():
+            raise InvalidPackageError("library_version must be a non-empty string")
 
-        fmt_ver = manifest.get("format_version")
-        # bool é subclasse de int — rejeitar explicitamente
-        if not isinstance(fmt_ver, int) or isinstance(fmt_ver, bool):
-            raise InvalidPackageError("manifest.json: format_version deve ser inteiro (não bool)")
-        if fmt_ver not in _SUPPORTED_FORMAT_VERSIONS:
-            raise InvalidPackageError(f"manifest.json: format_version {fmt_ver!r} não suportado")
-
-        lib_ver = manifest.get("library_version")
-        if not isinstance(lib_ver, str) or not lib_ver.strip():
-            raise InvalidPackageError("manifest.json: library_version deve ser string não vazia")
-
-        declared_files = manifest.get("files", [])
-        if not isinstance(declared_files, list):
-            raise InvalidPackageError("manifest.json: 'files' deve ser lista")
-        if not all(isinstance(f, str) for f in declared_files):
-            raise InvalidPackageError("manifest.json: 'files' deve conter somente strings")
-
-        # Sem duplicatas em files
+        declared_files = manifest.get("files")
+        expected_hashes = manifest.get("hashes")
+        if not isinstance(declared_files, list) or not all(
+            isinstance(name, str) for name in declared_files
+        ):
+            raise InvalidPackageError("manifest files must be a list of strings")
         if len(declared_files) != len(set(declared_files)):
-            raise InvalidPackageError("manifest.json: 'files' contém entradas duplicadas")
+            raise InvalidPackageError("manifest files contains duplicates")
+        if not isinstance(expected_hashes, dict) or not all(
+            isinstance(name, str) and isinstance(digest, str) and _VALID_HASH_RE.fullmatch(digest)
+            for name, digest in expected_hashes.items()
+        ):
+            raise InvalidPackageError("manifest hashes are invalid")
 
-        expected_hashes = manifest.get("hashes", {})
-        if not isinstance(expected_hashes, dict):
-            raise InvalidPackageError("manifest.json: 'hashes' deve ser objeto")
+        declared_set = set(declared_files)
+        hash_set = set(expected_hashes)
+        if declared_set != hash_set:
+            raise InvalidPackageError("manifest files and hashes must match exactly")
+        actual_set = set(files)
+        expected_actual = declared_set | {"manifest.json"}
+        if actual_set != expected_actual:
+            raise InvalidPackageError("archive members do not match the manifest")
 
-        # Valida formato dos hashes
-        for fname, digest in expected_hashes.items():
-            if not isinstance(digest, str) or not _VALID_HASH_RE.match(digest):
-                raise InvalidPackageError(
-                    f"manifest.json: hash inválido para {fname!r}: {digest!r}"
-                )
-
-        # files e hashes devem ter exatamente os mesmos nomes
-        files_set = set(declared_files)
-        hashes_set = set(expected_hashes.keys())
-        if files_set != hashes_set:
-            extra_in_hashes = hashes_set - files_set
-            missing_hashes = files_set - hashes_set
-            parts = []
-            if extra_in_hashes:
-                parts.append(f"hashes extras: {sorted(extra_in_hashes)}")
-            if missing_hashes:
-                parts.append(f"arquivos sem hash: {sorted(missing_hashes)}")
-            raise InvalidPackageError(
-                "manifest.json: 'files' e 'hashes' não coincidem — " + "; ".join(parts)
-            )
-
-        # Arquivos reais no pacote devem ser exatamente files + manifest.json
-        actual = set(files.keys())
-        expected_actual = files_set | {"manifest.json"}
-        extra_in_archive = actual - expected_actual
-        if extra_in_archive:
-            raise InvalidPackageError(
-                f"arquivos não declarados no manifesto: {sorted(extra_in_archive)}"
-            )
-        missing_in_archive = files_set - actual
-        if missing_in_archive:
-            raise InvalidPackageError(
-                f"arquivos declarados ausentes no pacote: {sorted(missing_in_archive)}"
-            )
-
-        # Verifica hashes SHA-256
-        mismatches = []
-        for name, digest in expected_hashes.items():
-            actual_digest = hashlib.sha256(files[name]).hexdigest()
-            if actual_digest != digest:
-                mismatches.append(f"alterado:{name}")
+        mismatches = [
+            name
+            for name, digest in expected_hashes.items()
+            if hashlib.sha256(files[name]).hexdigest() != digest
+        ]
         if mismatches:
-            raise IntegrityError(", ".join(mismatches))
-
+            raise IntegrityError(
+                "package integrity check failed for: " + ", ".join(sorted(mismatches))
+            )
         return cast(dict[str, Any], manifest)
 
     def verify(self, location: str | Path) -> dict[str, Any]:
-        """Verifica integridade completa do pacote antes de qualquer uso."""
-        files = self.load_files(location)
-        return self.verify_files(files)
+        return self.verify_files(self.load_files(location))
 
-    def _build_files(self, record: FailureRecord, extra: dict[str, Any]) -> dict[str, bytes]:
+    def _build_files(
+        self,
+        record: FailureRecord,
+        extra: dict[str, Any],
+    ) -> dict[str, bytes]:
         record_data = self.serializer.encode(record)
-        files = {
+        files: dict[str, bytes] = {
             "summary.json": self._json_bytes(
                 {
                     "incident_id": record.incident_id,
@@ -358,15 +298,14 @@ class ArchiveStorage:
             "README.txt": self._readme(record).encode("utf-8"),
         }
         traceback_text = extra.get("traceback_text")
-        if traceback_text:
+        if traceback_text is not None:
             files["traceback.txt"] = str(traceback_text).encode("utf-8", errors="replace")
         if extra.get("fingerprint_canonical") is not None:
             files["fingerprint-canonical.json"] = self._json_bytes(extra["fingerprint_canonical"])
         if extra.get("threads"):
             files["threads.json"] = self._json_bytes(self.serializer.encode(extra["threads"]))
-        replay = extra.get("replay")
-        if replay:
-            files["replay.json"] = self._json_bytes(replay)
+        if extra.get("replay") is not None:
+            files["replay.json"] = self._json_bytes(extra["replay"])
         return files
 
     def _json_bytes(self, value: Any) -> bytes:
@@ -380,9 +319,9 @@ class ArchiveStorage:
 
     def _filename(self, record: FailureRecord) -> str:
         operation = record.operation or self.config.filename_prefix
-        operation = _SAFE_NAME.sub("-", operation).strip("-._") or "failure"
-        short_id = record.incident_id.split("-")[0]
-        return f"{operation}-{record.fingerprint}-{short_id}.tseed"
+        safe_operation = _SAFE_NAME.sub("-", operation).strip("-._") or "failure"
+        safe_incident = _SAFE_NAME.sub("-", record.incident_id).strip("-._") or "incident"
+        return f"{safe_operation}-{record.fingerprint}-{safe_incident}.tseed"
 
     @staticmethod
     def _readme(record: FailureRecord) -> str:
@@ -392,9 +331,7 @@ class ArchiveStorage:
             f"Incident: {record.incident_id}\n"
             f"Fingerprint: {record.fingerprint}\n"
             f"Exception: {record.exception.type_name}: {record.exception.message}\n\n"
-            "Security warning: a package may contain application data. Review it before sharing.\n"
+            "Security warning: this package may contain application data.\n"
+            "SHA-256 hashes detect corruption but do not authenticate origin.\n"
             "Never replay a package received from an untrusted source.\n"
-            "Note: SHA-256 hashes detect accidental corruption but do NOT authenticate origin.\n"
-            "An attacker who can modify the ZIP can also recalculate the hashes.\n"
-            "Only replay packages from trusted sources.\n"
         )

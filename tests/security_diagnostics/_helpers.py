@@ -56,8 +56,7 @@ def write_tseed(path: Path, payloads: dict[str, bytes | str]) -> Path:
         "operation": "security-diagnostic",
         "files": sorted(normalized),
         "hashes": {
-            name: hashlib.sha256(content).hexdigest()
-            for name, content in normalized.items()
+            name: hashlib.sha256(content).hexdigest() for name, content in normalized.items()
         },
     }
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:

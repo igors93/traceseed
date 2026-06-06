@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import zipfile
+
 import pytest
 
 from traceseed import TraceSeedConfig, capture_exception

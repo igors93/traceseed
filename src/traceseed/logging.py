@@ -1,4 +1,4 @@
-"""Integração opcional com logging como breadcrumbs."""
+"""Logging integration that records log messages as breadcrumbs."""
 
 from __future__ import annotations
 
@@ -8,17 +8,16 @@ from .context import breadcrumb
 
 
 class BreadcrumbHandler(logging.Handler):
-    """Converte registros de logging em breadcrumbs do contexto atual."""
+    """Convert log records into TraceSeed breadcrumbs."""
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            message = self.format(record)
             breadcrumb(
-                "logging",
-                record.getMessage(),
+                record.name or "logging",
+                message,
                 level=record.levelname.casefold(),
                 logger=record.name,
-                pathname=record.pathname,
-                line=record.lineno,
             )
         except Exception:
             self.handleError(record)

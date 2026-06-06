@@ -1,17 +1,4 @@
-"""API pública: decoradores, context managers, hooks globais e registro.
-
-Semântica de strict:
-  strict=False (padrão): falhas internas de captura não substituem a exceção
-    original; o erro vai para stderr; re_raise continua funcionando normalmente.
-  strict=True: falhas internas levantam StorageError (com exceção original como
-    __cause__); falha de callback levanta CallbackError; o comportamento é igual
-    nos quatro contextos de captura.
-
-asyncio hooks:
-  install_asyncio() é idempotente por loop: instalar duas vezes não empilha
-  wrappers. Usa WeakKeyDictionary para evitar retenção de loops e colisão
-  de id() após garbage collection.
-"""
+"""Public capture API, hooks, and extension registration."""
 
 from __future__ import annotations
 
@@ -23,6 +10,7 @@ import threading
 import weakref
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from inspect import BoundArguments
 from typing import Any, TypeVar
 
@@ -31,82 +19,113 @@ from .config import TraceSeedConfig, get_config
 from .engine import CaptureEngine
 from .errors import CallbackError, StorageError
 from .models import CallableInfo, CaptureContext, CaptureResult
-from .serialization import SafeSerializer
+from .serialization import SafeSerializer, ValueCodec
 from .storage.archive import ArchiveStorage
 
 F = TypeVar("F", bound=Callable[..., Any])
 
-_global_registry: CollectorRegistry = CollectorRegistry()
-_global_codecs: dict[str, Any] = {}
-_installed: bool = False
+_global_registry = CollectorRegistry()
+_global_codecs: dict[str, ValueCodec] = {}
+_registry_lock = threading.RLock()
+_last_capture_var: ContextVar[CaptureResult | None] = ContextVar(
+    "traceseed_last_capture",
+    default=None,
+)
+_installed = False
 _old_excepthook: Any = None
 _old_thread_excepthook: Any = None
-_last_capture: CaptureResult | None = None
-
-# Asyncio: WeakKeyDictionary usa a referência real do loop como chave.
-# Quando o loop é coletado pelo GC, a entrada some automaticamente.
-# Isso evita colisões de id() entre loops destruídos e novos.
 _asyncio_handlers: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any] = (
     weakref.WeakKeyDictionary()
 )
 
-_SKIP_TYPES = (KeyboardInterrupt, SystemExit)
-
 
 def _make_serializer(config: TraceSeedConfig) -> SafeSerializer:
-    ser = SafeSerializer(config)
-    for codec in _global_codecs.values():
-        ser.register_codec(codec)
-    return ser
+    serializer = SafeSerializer(config)
+    with _registry_lock:
+        codecs = tuple(_global_codecs.values())
+    for codec in codecs:
+        serializer.register_codec(codec)
+    return serializer
 
 
-def _default_storage(config: TraceSeedConfig, serializer: SafeSerializer) -> ArchiveStorage:
+def _default_storage(
+    config: TraceSeedConfig,
+    serializer: SafeSerializer,
+) -> ArchiveStorage:
     return ArchiveStorage(config, serializer)
 
 
-def _is_importable(func: Callable[..., Any]) -> bool:
-    module = getattr(func, "__module__", None)
-    qualname = getattr(func, "__qualname__", "")
-    if module in (None, "__main__"):
-        return False
-    return "<locals>" not in qualname
+def _is_importable(function: Callable[..., Any]) -> bool:
+    module = getattr(function, "__module__", None)
+    qualname = getattr(function, "__qualname__", "")
+    return (
+        isinstance(module, str)
+        and module not in {"", "__main__"}
+        and isinstance(qualname, str)
+        and "<locals>" not in qualname
+    )
 
 
-def _bind_arguments(func: Callable[..., Any], args: tuple, kwargs: dict) -> dict[str, Any]:
+def _bind_arguments(
+    function: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
     try:
-        sig = inspect.signature(func)
-        bound: BoundArguments = sig.bind(*args, **kwargs)
+        signature = inspect.signature(function)
+        bound: BoundArguments = signature.bind(*args, **kwargs)
         bound.apply_defaults()
         return dict(bound.arguments)
     except (TypeError, ValueError):
         return {}
 
 
-def _raise_strict(storage_error_msg: str, original: BaseException) -> None:
-    """Levanta StorageError preservando a exceção original como __cause__."""
-    raise StorageError(storage_error_msg) from original
-
-
 def _invoke_callback(
-    on_captured: Callable[[CaptureResult], Any],
+    callback: Callable[[CaptureResult], Any],
     result: CaptureResult,
     strict: bool,
     original: BaseException,
 ) -> None:
-    """Invoca on_captured respeitando strict."""
     if strict:
         try:
-            on_captured(result)
-        except Exception as cb_err:
-            raise CallbackError(str(cb_err)) from original
+            callback(result)
+        except Exception as error:
+            raise CallbackError(str(error)) from original
     else:
         with suppress(Exception):
-            on_captured(result)
+            callback(result)
 
 
-# ---------------------------------------------------------------------------
-# capture_exception
-# ---------------------------------------------------------------------------
+def _build_engine(
+    config: TraceSeedConfig,
+    storage: Any,
+) -> CaptureEngine:
+    serializer = _make_serializer(config)
+    selected_storage = storage if storage is not None else _default_storage(config, serializer)
+    return CaptureEngine(
+        config=config,
+        collectors=_global_registry,
+        storage=selected_storage,
+        serializer=serializer,
+    )
+
+
+def _handle_capture_result(
+    result: CaptureResult,
+    *,
+    strict: bool,
+    original: BaseException,
+    callback: Callable[[CaptureResult], Any] | None,
+) -> CaptureResult | None:
+    if result.capture_error:
+        if strict:
+            raise StorageError(result.capture_error) from original
+        print(f"traceseed: {result.capture_error}", file=sys.stderr)
+        return None
+    _last_capture_var.set(result)
+    if callback is not None:
+        _invoke_callback(callback, result, strict, original)
+    return result
 
 
 def capture_exception(
@@ -117,177 +136,159 @@ def capture_exception(
     metadata: dict[str, Any] | None = None,
     operation: str | None = None,
     callable_info: CallableInfo | None = None,
-    replay_arguments: tuple | None = None,
-    replay_keyword_arguments: dict | None = None,
+    replay_arguments: tuple[Any, ...] | None = None,
+    replay_keyword_arguments: dict[str, Any] | None = None,
     strict: bool = False,
     on_captured: Callable[[CaptureResult], Any] | None = None,
 ) -> CaptureResult | None:
     if not isinstance(exception, BaseException):
-        raise TypeError(f"esperado BaseException, recebeu {type(exception).__name__}")
-
-    cfg = config or get_config()
-    ser = _make_serializer(cfg)
-    stor = storage if storage is not None else _default_storage(cfg, ser)
-
-    ctx = CaptureContext(
-        operation=operation,
-        metadata=metadata or {},
-        arguments={},
-        callable_info=callable_info,
-        replay_arguments=replay_arguments,
-        replay_keyword_arguments=replay_keyword_arguments,
-    )
-
-    engine = CaptureEngine(
-        config=cfg,
-        collectors=_global_registry,
-        storage=stor,
-        serializer=ser,
-    )
-
-    result = engine.capture(exception, ctx)
-
-    if result.capture_error:
+        raise TypeError(f"expected BaseException, got {type(exception).__name__}")
+    selected_config = config or get_config()
+    try:
+        engine = _build_engine(selected_config, storage)
+        context = CaptureContext(
+            operation=operation,
+            metadata=dict(metadata or {}),
+            arguments={},
+            callable_info=callable_info,
+            replay_arguments=replay_arguments,
+            replay_keyword_arguments=replay_keyword_arguments,
+        )
+        result = engine.capture(exception, context)
+    except Exception as error:
         if strict:
-            raise StorageError(result.capture_error) from exception
-        print(f"traceseed: {result.capture_error}", file=sys.stderr)
+            raise StorageError(
+                f"traceseed setup failed: {type(error).__name__}: {error}"
+            ) from exception
+        print(
+            f"traceseed: setup failed: {type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
         return None
-
-    global _last_capture
-    _last_capture = result
-
-    if on_captured is not None:
-        _invoke_callback(on_captured, result, strict, exception)
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Decorator @capture
-# ---------------------------------------------------------------------------
+    return _handle_capture_result(
+        result,
+        strict=strict,
+        original=exception,
+        callback=on_captured,
+    )
 
 
 def capture(
-    func: F | None = None,
+    function: F | None = None,
     *,
     storage: Any = None,
     config: TraceSeedConfig | None = None,
     replayable: bool = False,
     operation: str | None = None,
+    metadata: dict[str, Any] | None = None,
     on_captured: Callable[[CaptureResult], Any] | None = None,
     strict: bool = False,
 ) -> Any:
-    def decorator(fn: F) -> F:
-        if asyncio.iscoroutinefunction(fn):
+    def decorator(wrapped: F) -> F:
+        if inspect.iscoroutinefunction(wrapped):
 
-            @functools.wraps(fn)
+            @functools.wraps(wrapped)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                cfg = config or get_config()
+                selected_config = config or get_config()
                 try:
-                    return await fn(*args, **kwargs)
-                except _SKIP_TYPES:
-                    raise
-                except BaseException as exc:
+                    return await wrapped(*args, **kwargs)
+                except Exception as error:
                     _capture_in_wrapper(
-                        fn,
+                        wrapped,
                         args,
                         kwargs,
-                        exc,
-                        cfg,
+                        error,
+                        selected_config,
                         replayable,
                         operation,
+                        metadata,
                         storage,
                         on_captured,
                         strict,
                     )
-                    if cfg.re_raise:
+                    if selected_config.re_raise:
                         raise
                     return None
 
-            return async_wrapper  # type: ignore
-        else:
+            return async_wrapper  # type: ignore[return-value]
 
-            @functools.wraps(fn)
-            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-                cfg = config or get_config()
-                try:
-                    return fn(*args, **kwargs)
-                except _SKIP_TYPES:
+        @functools.wraps(wrapped)
+        def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+            selected_config = config or get_config()
+            try:
+                return wrapped(*args, **kwargs)
+            except Exception as error:
+                _capture_in_wrapper(
+                    wrapped,
+                    args,
+                    kwargs,
+                    error,
+                    selected_config,
+                    replayable,
+                    operation,
+                    metadata,
+                    storage,
+                    on_captured,
+                    strict,
+                )
+                if selected_config.re_raise:
                     raise
-                except BaseException as exc:
-                    _capture_in_wrapper(
-                        fn,
-                        args,
-                        kwargs,
-                        exc,
-                        cfg,
-                        replayable,
-                        operation,
-                        storage,
-                        on_captured,
-                        strict,
-                    )
-                    if cfg.re_raise:
-                        raise
-                    return None
+                return None
 
-            return sync_wrapper  # type: ignore
+        return sync_wrapper  # type: ignore[return-value]
 
-    if func is not None:
-        return decorator(func)
+    if function is not None:
+        return decorator(function)
     return decorator
 
 
 def _capture_in_wrapper(
-    fn: Callable[..., Any],
-    args: tuple,
-    kwargs: dict,
-    exc: BaseException,
-    cfg: TraceSeedConfig,
+    function: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    exception: Exception,
+    config: TraceSeedConfig,
     replayable: bool,
     operation: str | None,
+    metadata: dict[str, Any] | None,
     storage: Any,
-    on_captured: Callable | None,
+    callback: Callable[[CaptureResult], Any] | None,
     strict: bool,
 ) -> None:
-    """Lógica comum de captura para decoradores sync e async."""
-    arguments = _bind_arguments(fn, args, kwargs)
-    importable = _is_importable(fn) and replayable
-    ci = CallableInfo(
-        module=getattr(fn, "__module__", ""),
-        qualname=getattr(fn, "__qualname__", ""),
+    importable = _is_importable(function) and replayable
+    callable_info = CallableInfo(
+        module=str(getattr(function, "__module__", "")),
+        qualname=str(getattr(function, "__qualname__", "")),
         replayable=importable,
-        reason=None if importable else ("callable não importável" if replayable else None),
+        reason=None if importable else ("callable is not importable" if replayable else None),
     )
-    op = operation or getattr(fn, "__qualname__", None)
-    ser = _make_serializer(cfg)
-    stor = storage if storage is not None else _default_storage(cfg, ser)
-    ctx = CaptureContext(
-        operation=op,
-        metadata={},
-        arguments=arguments,
-        callable_info=ci,
-        replay_arguments=args if importable else None,
-        replay_keyword_arguments=kwargs if importable else None,
-    )
-    engine = CaptureEngine(cfg, _global_registry, stor, ser)
-    result = engine.capture(exc, ctx)
-
-    if result.capture_error:
+    try:
+        engine = _build_engine(config, storage)
+        context = CaptureContext(
+            operation=operation or getattr(function, "__qualname__", None),
+            metadata=dict(metadata or {}),
+            arguments=_bind_arguments(function, args, kwargs) if config.capture_arguments else {},
+            callable_info=callable_info,
+            replay_arguments=args if importable else None,
+            replay_keyword_arguments=kwargs if importable else None,
+        )
+        result = engine.capture(exception, context)
+    except Exception as error:
         if strict:
-            raise StorageError(result.capture_error) from exc
-        print(f"traceseed: {result.capture_error}", file=sys.stderr)
+            raise StorageError(
+                f"traceseed setup failed: {type(error).__name__}: {error}"
+            ) from exception
+        print(
+            f"traceseed: setup failed: {type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
         return
-
-    global _last_capture
-    _last_capture = result
-    if on_captured:
-        _invoke_callback(on_captured, result, strict, exc)
-
-
-# ---------------------------------------------------------------------------
-# guard context manager
-# ---------------------------------------------------------------------------
+    _handle_capture_result(
+        result,
+        strict=strict,
+        original=exception,
+        callback=callback,
+    )
 
 
 @contextmanager
@@ -296,93 +297,70 @@ def guard(
     *,
     storage: Any = None,
     config: TraceSeedConfig | None = None,
+    metadata: dict[str, Any] | None = None,
     on_captured: Callable[[CaptureResult], Any] | None = None,
     strict: bool = False,
 ) -> Generator[None, None, None]:
-    cfg = config or get_config()
+    selected_config = config or get_config()
     try:
         yield
-    except _SKIP_TYPES:
-        raise
-    except BaseException as exc:
-        ser = _make_serializer(cfg)
-        stor = storage if storage is not None else _default_storage(cfg, ser)
-        ctx = CaptureContext(operation=operation, metadata={}, arguments={})
-        engine = CaptureEngine(cfg, _global_registry, stor, ser)
-        result = engine.capture(exc, ctx)
-
-        if result.capture_error:
-            if strict:
-                raise StorageError(result.capture_error) from exc
-            print(f"traceseed: {result.capture_error}", file=sys.stderr)
-        else:
-            global _last_capture
-            _last_capture = result
-            if on_captured:
-                _invoke_callback(on_captured, result, strict, exc)
-
-        if cfg.re_raise:
+    except Exception as error:
+        result = capture_exception(
+            error,
+            config=selected_config,
+            storage=storage,
+            metadata=metadata,
+            operation=operation,
+            strict=strict,
+            on_captured=on_captured,
+        )
+        del result
+        if selected_config.re_raise:
             raise
 
 
-# ---------------------------------------------------------------------------
-# Hooks globais
-# ---------------------------------------------------------------------------
-
-
 def install(storage: Any = None, config: TraceSeedConfig | None = None) -> None:
-    """Instala hooks em sys.excepthook e threading.excepthook.
-
-    É idempotente: chamadas repetidas não instalam hooks duplos.
-    O hook anterior (incluindo handlers customizados) é sempre chamado.
-    """
     global _installed, _old_excepthook, _old_thread_excepthook
-
     if _installed:
         return
+    previous_sys = sys.excepthook
+    previous_thread = threading.excepthook
 
-    cfg = config
-    stor = storage
-    # Captura os handlers atuais antes de sobrescrever
-    prev_sys = sys.excepthook
-    prev_thread = threading.excepthook
-
-    def _sys_excepthook(exc_type: type, exc_value: BaseException, exc_tb: Any) -> None:
-        with suppress(Exception):
-            capture_exception(exc_value, config=cfg, storage=stor)
-        # Chama o handler que estava instalado antes do TraceSeed
-        try:
-            prev_sys(exc_type, exc_value, exc_tb)
-        except Exception:
-            sys.__excepthook__(exc_type, exc_value, exc_tb)
-
-    def _thread_excepthook(hook_args: threading.ExceptHookArgs) -> None:
-        if hook_args.exc_value is not None:
+    def system_hook(
+        exception_type: type[BaseException],
+        exception: BaseException,
+        traceback: Any,
+    ) -> None:
+        if isinstance(exception, Exception):
             with suppress(Exception):
-                capture_exception(hook_args.exc_value, config=cfg, storage=stor)
-        # Chama o handler anterior
-        with suppress(Exception):
-            prev_thread(hook_args)
+                capture_exception(exception, config=config, storage=storage)
+        try:
+            previous_sys(exception_type, exception, traceback)
+        except Exception:
+            sys.__excepthook__(exception_type, exception, traceback)
 
-    _old_excepthook = prev_sys
-    _old_thread_excepthook = prev_thread
-    sys.excepthook = _sys_excepthook
-    threading.excepthook = _thread_excepthook
+    def thread_hook(arguments: threading.ExceptHookArgs) -> None:
+        if isinstance(arguments.exc_value, Exception):
+            with suppress(Exception):
+                capture_exception(arguments.exc_value, config=config, storage=storage)
+        with suppress(Exception):
+            previous_thread(arguments)
+
+    _old_excepthook = previous_sys
+    _old_thread_excepthook = previous_thread
+    sys.excepthook = system_hook
+    threading.excepthook = thread_hook
     _installed = True
 
 
 def uninstall() -> None:
-    """Restaura exatamente os hooks que estavam instalados antes de install()."""
     global _installed, _old_excepthook, _old_thread_excepthook
-
     if not _installed:
         return
-
     if _old_excepthook is not None:
         sys.excepthook = _old_excepthook
     if _old_thread_excepthook is not None:
         threading.excepthook = _old_thread_excepthook
-
     _old_excepthook = None
     _old_thread_excepthook = None
     _installed = False
@@ -393,81 +371,68 @@ def install_asyncio(
     storage: Any = None,
     config: TraceSeedConfig | None = None,
 ) -> asyncio.AbstractEventLoop:
-    """Instala handler de exceções no loop asyncio, preservando o handler anterior.
-
-    É idempotente por loop: instalar duas vezes não empilha wrappers.
-    Usa WeakKeyDictionary para evitar retenção do loop e colisão de id().
-
-    Retorna o loop configurado (útil para chamar uninstall_asyncio depois).
-    """
-    cfg = config
-    stor = storage
-
     try:
-        lp = loop or asyncio.get_event_loop()
+        selected_loop = loop or asyncio.get_event_loop()
     except RuntimeError:
-        lp = asyncio.new_event_loop()
+        selected_loop = asyncio.new_event_loop()
+    if selected_loop in _asyncio_handlers:
+        return selected_loop
+    previous = selected_loop.get_exception_handler()
+    _asyncio_handlers[selected_loop] = previous
 
-    # Idempotência: se já instalado neste loop, retorna sem re-instalar
-    if lp in _asyncio_handlers:
-        return lp
-
-    old_handler = lp.get_exception_handler()
-    _asyncio_handlers[lp] = old_handler
-
-    def _asyncio_handler(lp2: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
-        exc = context.get("exception")
-        if exc is not None:
+    def handler(
+        current_loop: asyncio.AbstractEventLoop,
+        context: dict[str, Any],
+    ) -> None:
+        exception = context.get("exception")
+        if isinstance(exception, Exception):
             with suppress(Exception):
-                capture_exception(exc, config=cfg, storage=stor)
-        if old_handler is not None:
+                capture_exception(exception, config=config, storage=storage)
+        if previous is not None:
             try:
-                old_handler(lp2, context)
+                previous(current_loop, context)
             except Exception:
-                lp2.default_exception_handler(context)
+                current_loop.default_exception_handler(context)
         else:
-            lp2.default_exception_handler(context)
+            current_loop.default_exception_handler(context)
 
-    lp.set_exception_handler(_asyncio_handler)
-    return lp
+    selected_loop.set_exception_handler(handler)
+    return selected_loop
 
 
 def uninstall_asyncio(loop: asyncio.AbstractEventLoop | None = None) -> None:
-    """Restaura o handler asyncio anterior ao install_asyncio().
-
-    É seguro chamar mais de uma vez (idempotente).
-    """
     try:
-        lp = loop or asyncio.get_event_loop()
+        selected_loop = loop or asyncio.get_event_loop()
     except RuntimeError:
         return
-
-    if lp not in _asyncio_handlers:
-        return
-
-    lp.set_exception_handler(_asyncio_handlers.pop(lp))
-
-
-# ---------------------------------------------------------------------------
-# Registro global
-# ---------------------------------------------------------------------------
+    if selected_loop in _asyncio_handlers:
+        selected_loop.set_exception_handler(_asyncio_handlers.pop(selected_loop))
 
 
 def get_last_capture() -> CaptureResult | None:
-    return _last_capture
+    return _last_capture_var.get()
 
 
 def register_collector(collector: Any) -> None:
-    _global_registry.register(collector)
+    with _registry_lock:
+        _global_registry.register(collector)
 
 
 def unregister_collector(name: str) -> None:
-    _global_registry.unregister(name)
+    with _registry_lock:
+        _global_registry.unregister(name)
 
 
-def register_codec(codec: Any) -> None:
-    _global_codecs[codec.type_name] = codec
+def register_codec(codec: ValueCodec) -> None:
+    type_name = getattr(codec, "type_name", None)
+    if not isinstance(type_name, str) or not type_name.strip():
+        raise ValueError("codec must declare a non-empty type_name")
+    with _registry_lock:
+        if type_name in _global_codecs:
+            raise ValueError(f"codec type_name {type_name!r} is already registered")
+        _global_codecs[type_name] = codec
 
 
 def unregister_codec(name: str) -> None:
-    _global_codecs.pop(name, None)
+    with _registry_lock:
+        _global_codecs.pop(name, None)

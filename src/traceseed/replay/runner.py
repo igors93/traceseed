@@ -1,15 +1,4 @@
-"""Reprodução assistida. Executa código somente com autorização explícita.
-
-Garantia de segurança: a integridade do pacote é SEMPRE verificada antes de
-qualquer importação ou execução de código. A verificação é centralizada em
-ArchiveStorage.verify_files() para evitar duplicação de regras.
-
-Replay é bloqueado quando:
-- hashes estão ausentes ou incompletos;
-- replay.json não possui hash;
-- qualquer arquivo foi adulterado;
-- replay.json declara replayable=false.
-"""
+"""Assisted replay with mandatory integrity and schema validation."""
 
 from __future__ import annotations
 
@@ -20,102 +9,130 @@ from typing import Any, cast
 
 from ..config import TraceSeedConfig
 from ..errors import InvalidPackageError, ReplayError, SerializationError
-from ..serialization import SafeSerializer
 from ..storage import ArchiveStorage
+
+_REQUIRED_REPLAY_FIELDS = frozenset(
+    {"replayable", "module", "qualname", "arguments", "keyword_arguments"}
+)
 
 
 class ReplayRunner:
     def __init__(self, config: TraceSeedConfig | None = None) -> None:
         self.config = config or TraceSeedConfig()
-        self.serializer = SafeSerializer(self.config)
+        from ..api import _make_serializer
+
+        self.serializer = _make_serializer(self.config)
         self.storage = ArchiveStorage(self.config, self.serializer)
 
-    def _verify_and_load(self, package: str | Path) -> tuple[dict[str, Any], dict[str, bytes]]:
-        """Verifica integridade completa antes de retornar conteúdo.
-
-        Delega toda a lógica de validação para ArchiveStorage — sem duplicação
-        de regras de manifesto. NUNCA pule este método antes de importar ou
-        executar código.
-        """
-        path = Path(package)
-        files = self.storage.load_files(path)
+    def _verify_and_load(
+        self,
+        package: str | Path,
+    ) -> tuple[dict[str, Any], dict[str, bytes]]:
+        files = self.storage.load_files(package)
         manifest = self.storage.verify_files(files)
         return manifest, files
 
-    def _check_replay_hash(self, manifest: dict[str, Any]) -> None:
-        """Garante que replay.json possui hash — bloqueia replay sem integridade."""
-        hashes = manifest.get("hashes", {})
-        if not hashes:
-            raise ReplayError("replay requer hashes de integridade (include_package_hashes=True)")
-        if "replay.json" not in hashes:
-            raise ReplayError("replay.json não possui hash — integridade não garantida")
+    @staticmethod
+    def _check_replay_hash(manifest: dict[str, Any]) -> None:
+        hashes = manifest.get("hashes")
+        if not isinstance(hashes, dict) or "replay.json" not in hashes:
+            raise ReplayError("replay.json is not protected by an integrity hash")
+
+    def _load_replay_data(
+        self,
+        manifest: dict[str, Any],
+        files: dict[str, bytes],
+    ) -> dict[str, Any]:
+        if "replay.json" not in files:
+            raise ReplayError("package does not contain replay data")
+        self._check_replay_hash(manifest)
+        payload = files["replay.json"]
+        if len(payload) > self.config.max_replay_payload_size:
+            raise ReplayError("replay payload exceeds the configured size limit")
+        try:
+            value = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise InvalidPackageError("replay.json is invalid") from error
+        if not isinstance(value, dict):
+            raise InvalidPackageError("replay.json must contain a JSON object")
+        return cast(dict[str, Any], value)
+
+    @staticmethod
+    def _validate_schema(
+        data: dict[str, Any],
+        *,
+        require_replayable: bool,
+    ) -> None:
+        replayable = data.get("replayable")
+        if not isinstance(replayable, bool):
+            raise ReplayError("replayable must be an explicit boolean")
+        if replayable is False:
+            if require_replayable:
+                reason = data.get("reason", "unknown reason")
+                raise ReplayError(f"replay is disabled: {reason}")
+            return
+        missing = _REQUIRED_REPLAY_FIELDS - set(data)
+        if missing:
+            raise ReplayError(f"replay.json is missing fields: {sorted(missing)}")
+        for name in ("module", "qualname"):
+            if not isinstance(data.get(name), str) or not data[name].strip():
+                raise ReplayError(f"{name} must be a non-empty string")
+        if data["module"] == "__main__" or "<locals>" in data["qualname"]:
+            raise ReplayError("replay target is not importable")
 
     def inspect(self, package: str | Path) -> dict[str, Any]:
-        """Inspeciona metadados de replay verificando integridade primeiro."""
         manifest, files = self._verify_and_load(package)
-        if "replay.json" not in files:
-            raise ReplayError("o pacote não contém dados de replay")
-        self._check_replay_hash(manifest)
-        try:
-            return cast(dict[str, Any], json.loads(files["replay.json"].decode("utf-8")))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise InvalidPackageError("replay.json inválido") from error
+        data = self._load_replay_data(manifest, files)
+        self._validate_schema(data, require_replayable=False)
+        return data
 
-    def run(self, package: str | Path, *, allow_code_execution: bool = False) -> Any:
-        """Executa replay do pacote.
-
-        A integridade é verificada ANTES de qualquer importação de módulo.
-        Replay com argumentos redigidos ou marcados como não reproduzíveis é bloqueado.
-        """
+    def run(
+        self,
+        package: str | Path,
+        *,
+        allow_code_execution: bool = False,
+    ) -> Any:
         if not allow_code_execution:
             raise ReplayError(
-                "replay executa código da aplicação; use allow_code_execution=True somente em pacote confiável"
+                "replay executes application code; explicit authorization is required"
             )
-
-        # Verificação de integridade obrigatória — nenhum import antes daqui
         manifest, files = self._verify_and_load(package)
+        data = self._load_replay_data(manifest, files)
+        self._validate_schema(data, require_replayable=True)
 
-        if "replay.json" not in files:
-            raise ReplayError("o pacote não contém dados de replay")
-
-        self._check_replay_hash(manifest)
-
-        try:
-            data = cast(dict[str, Any], json.loads(files["replay.json"].decode("utf-8")))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise InvalidPackageError("replay.json inválido") from error
-
-        # Verifica flag replayable (novo formato) — backward compat: ausente = True
-        if not data.get("replayable", True):
-            reason = data.get("reason", "unknown")
-            raise ReplayError(f"replay desabilitado: {reason}")
-
-        # Só importa/executa código depois da verificação aprovada
-        target = self._resolve(data["module"], data["qualname"])
         try:
             args = self.serializer.decode(data["arguments"], allow_imports=True)
-            kwargs = self.serializer.decode(data["keyword_arguments"], allow_imports=True)
+            kwargs = self.serializer.decode(
+                data["keyword_arguments"],
+                allow_imports=True,
+            )
         except SerializationError as error:
             raise ReplayError(str(error)) from error
+        except Exception as error:
+            raise ReplayError(
+                f"unable to decode replay arguments: {type(error).__name__}: {error}"
+            ) from error
         if not isinstance(args, (list, tuple)):
-            raise ReplayError("argumentos posicionais inválidos")
+            raise ReplayError("positional arguments must decode to a list or tuple")
         if not isinstance(kwargs, dict):
-            raise ReplayError("argumentos nomeados inválidos")
+            raise ReplayError("keyword arguments must decode to a dictionary")
+
+        target = self._resolve(data["module"], data["qualname"])
         return target(*args, **kwargs)
 
     @staticmethod
     def _resolve(module_name: str, qualname: str) -> Any:
-        if module_name in {"", "__main__"} or "<locals>" in qualname:
-            raise ReplayError("callable não importável")
         try:
             module = importlib.import_module(module_name)
             target: Any = module
             for part in qualname.split("."):
-                if part.startswith("__"):
-                    raise ReplayError("qualname inseguro")
+                if not part or part.startswith("__") or part == "<locals>":
+                    raise ReplayError("unsafe replay qualname")
                 target = getattr(target, part)
             if not callable(target):
-                raise ReplayError("alvo do replay não é chamável")
+                raise ReplayError("replay target is not callable")
             return target
+        except ReplayError:
+            raise
         except (ImportError, AttributeError) as error:
-            raise ReplayError(f"não foi possível importar callable: {error}") from error
+            raise ReplayError("unable to import replay target") from error
