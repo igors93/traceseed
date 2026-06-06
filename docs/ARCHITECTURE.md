@@ -1,64 +1,76 @@
-# Arquitetura do TraceSeed
+# TraceSeed Architecture
 
-## Objetivos
+## Goals
 
-1. API pública pequena e previsível.
-2. Falhas internas nunca escondem a exceção original.
-3. Dados sensíveis são removidos antes da persistência.
-4. Componentes de coleta, serialização e armazenamento podem ser substituídos.
-5. O formato `.tseed` é verificável e versionado.
-6. O formato `.tseed` é auditável: hashes detectam corrupção acidental (não autenticam origem).
+1. **Small, predictable public API.**
+2. **Internal failures never hide the original exception.** A global failure boundary in `CaptureEngine.capture()` catches any unexpected error and returns a safe `CaptureResult` with a `capture_error` field.
+3. **Sensitive data is removed before persistence.** Sanitization happens inside the engine, before the storage layer is called.
+4. **Collectors, serializers, and storage backends are replaceable** without modifying the engine.
+5. **The `.tseed` format is versioned and auditable.** SHA-256 hashes detect accidental corruption; they do not authenticate origin.
+6. **Fingerprints are machine-portable.** The canonical representation uses `frame.module` (e.g. `"app.services"`) instead of absolute file paths, so the same failure on different machines produces the same fingerprint.
 
-## Fluxo
+---
+
+## Capture flow
 
 ```text
 @capture / guard / capture_exception
                  │
                  ▼
-          CaptureContext
+          CaptureContext          (in-memory, per-call)
                  │
                  ▼
           CaptureEngine
-          ├─ collectors
-          ├─ redactor
-          ├─ fingerprinter
-          ├─ serializer
-          └─ storage
+          ├─ collectors           (independent; errors recorded, not raised)
+          ├─ redactor             (sanitizes before anything is written)
+          ├─ fingerprinter        (uses already-sanitized data)
+          ├─ serializer           (safe JSON encoding)
+          └─ storage              (atomic write)
                  │
                  ▼
-          FailureRecord
+          FailureRecord           (immutable dataclass)
                  │
                  ▼
-       .tseed / diretório / memória
+       .tseed / directory / memory
 ```
 
-## API pública
+---
 
-`api.py` mantém a superfície de uso pequena:
+## Public API (`api.py`)
 
-- `capture`
-- `guard`
-- `capture_exception`
-- `register_collector`
-- `install`, `uninstall`, `install_asyncio`
+The public surface is intentionally small:
 
-Ela cria um `CaptureContext` e entrega a operação ao engine.
+| Symbol | Purpose |
+|---|---|
+| `capture` | decorator |
+| `guard` | context manager |
+| `capture_exception` | manual capture |
+| `register_collector` | add a custom collector |
+| `install` / `uninstall` | sys.excepthook hooks |
+| `install_asyncio` / `uninstall_asyncio` | asyncio loop hooks |
 
-## Engine
+Each entry point builds a `CaptureContext` and delegates to the engine. Asyncio hooks use a `WeakKeyDictionary` keyed on the actual loop object to prevent id()-collision after GC and avoid leaking closed loops.
 
-O `CaptureEngine` é um orquestrador. Ele não contém detalhes específicos de coleta ou I/O. Sua sequência é:
+---
 
-1. Executar coletores isoladamente.
-2. Registrar falhas individuais de coletores.
-3. Sanitizar exceção, frames, argumentos, contexto e breadcrumbs.
-4. Gerar a fingerprint com dados já sanitizados.
-5. Avaliar se os argumentos permitem replay.
-6. Criar um `FailureRecord` imutável.
-7. Persistir pelo protocolo `Storage`.
+## Engine (`engine.py`)
 
-## Coletores
+`CaptureEngine` is an orchestrator. It contains no collection or I/O details. Its sequence:
 
-Cada coletor implementa:
+1. Run each collector in isolation; record failures in `collector_errors`.
+2. Sanitize exception info, frames, arguments, context, and breadcrumbs.
+3. Generate the fingerprint from already-sanitized data.
+4. Evaluate whether arguments allow safe replay (no redacted/truncated/unresolvable values).
+5. Build an immutable `FailureRecord`.
+6. Persist via the `Storage` protocol.
+
+The entire `_capture_impl()` call is wrapped in a `try/except` at the `capture()` level. Any unexpected internal error is caught and returned as `CaptureResult(capture_error="traceseed internal error: …")` rather than raised.
+
+---
+
+## Collectors (`collectors/`)
+
+Each collector implements:
 
 ```python
 name: str
@@ -67,72 +79,111 @@ def collect(exception, context, config) -> dict:
     ...
 ```
 
-Os coletores nativos são independentes:
+Built-in collectors:
 
-- `ExceptionCollector`
-- `TracebackCollector`
-- `RuntimeCollector`
-- `ContextCollector`
-- `ThreadCollector`
+| Collector | Data |
+|---|---|
+| `ExceptionCollector` | type, message, notes, chained exceptions |
+| `TracebackCollector` | formatted traceback text |
+| `RuntimeCollector` | Python version, platform, `sys.argv` (opt-in), cwd |
+| `ContextCollector` | contextvars context and breadcrumbs |
+| `ThreadCollector` | active thread info |
 
-Uma falha em um coletor não interrompe os demais.
+A failing collector is recorded and does not interrupt the others. `build_exception_info()` protects against cycles (via a `frozenset` of seen ids), depth overflow, broken `str()`/`repr()`, and non-string `__notes__`.
 
-## Sanitização
+---
 
-`Redactor` processa dados recursivamente e possui quatro proteções:
+## Sanitization (`redaction.py`)
 
-- nomes de campos sensíveis;
-- expressões regulares;
-- limites de profundidade e tamanho;
-- detecção de referências circulares.
+`Redactor` processes data recursively with four protections:
 
-A sanitização acontece antes de qualquer chamada ao storage.
+- Sensitive field names (exact and prefix match).
+- Regular expressions (bearer tokens, card-like numbers).
+- Depth and collection-size limits.
+- Circular reference detection.
 
-## Serialização
+Sanitization runs before any call to storage. `source_line` from frames is also sanitized. `sys.argv` is only captured when `capture_argv=True` (default: `False`).
 
-`SafeSerializer` converte dados para uma árvore JSON tipada. Ele não usa `pickle`.
+---
 
-Tipos reconstruíveis incluem primitivos, bytes, coleções, datas, `Decimal`, `UUID`, `Path`, enums e dataclasses. Enums e dataclasses exigem autorização de importação no decode.
+## Serialization (`serialization.py`)
 
-Objetos arbitrários viram registros `unresolved` para diagnóstico e bloqueiam replay automático.
+`SafeSerializer` converts data to a typed JSON tree. It never uses `pickle`.
 
-## Fingerprint
+Reconstructable types: primitives, bytes, collections, dates, `Decimal`, `UUID`, `Path`, enums, and dataclasses. Enums and dataclasses require import authorization at decode time.
 
-A fingerprint usa SHA-256 sobre uma representação canônica composta por:
+Arbitrary objects produce `unresolved` records for diagnostics and automatically disable replay for that invocation.
 
-- classe da exceção;
-- mensagem normalizada;
-- frames finais limitados;
-- causa imediata.
+---
 
-Valores variáveis como números, UUIDs, tokens longos e endereços hexadecimais são normalizados. O algoritmo possui versão no formato canônico.
+## Fingerprinting (`fingerprint.py`)
 
-## Armazenamento
+The fingerprint is SHA-256 over a canonical representation:
 
-### ArchiveStorage
+- Exception class and normalized message.
+- Final N frames (limited).
+- Immediate cause type.
 
-Cria um ZIP com extensão `.tseed`. Todos os arquivos diagnósticos recebem SHA-256 no manifesto. A gravação usa arquivo temporário e `os.replace`.
+Variable values (numbers, UUIDs, long tokens, hex addresses) are normalized before hashing. The canonical representation carries `algorithm_version: 2`. Frames use `frame.module` as the primary identifier; when module is unavailable, the last three path components are used as a fallback.
 
-### DirectoryStorage
+---
 
-Cria a mesma estrutura em um diretório, facilitando inspeção durante desenvolvimento.
+## Storage backends
 
-### MemoryStorage
+### `ArchiveStorage`
 
-Mantém `FailureRecord` em memória para testes e integrações.
+Creates a ZIP file with the `.tseed` extension. Every diagnostic file receives a SHA-256 entry in the manifest. Writes use a temporary file and `os.replace` for atomicity.
 
-## Replay
+ZIP loading applies safety checks in strict order before reading any content:
 
-O replay é deliberadamente separado da captura:
+1. Entry count limit.
+2. Name validation (no absolute paths, traversal, or empty names).
+3. Duplicate detection.
+4. Type rejection (directories, encrypted entries, symlinks).
+5. Per-file size check (from metadata, before extraction).
+6. Total size check.
+7. Manifest size check.
+8. Content read with a byte limit to detect misleading headers.
 
-1. O pacote precisa conter `replay.json`.
-2. O usuário precisa autorizar execução explicitamente.
-3. O módulo e o callable são importados.
-4. Argumentos são reconstruídos pelo serializer.
-5. A função é executada.
+### `DirectoryStorage`
 
-Isso é reprodução assistida, não sandbox.
+Creates the same structure unpacked into a directory, useful for inspection during development.
 
-## Compatibilidade
+### `MemoryStorage`
 
-A versão inicial exige Python 3.11 por usar recursos como `ExceptionGroup`, typing moderno e `tomllib` disponível no ecossistema padrão, embora o núcleo não dependa de `tomllib`.
+Holds `FailureRecord` in memory. Intended for tests and integrations.
+
+---
+
+## Manifest validation
+
+`verify_files()` is the single authority for manifest checks:
+
+- `format_version` must be a real `int`, not a `bool` (Python subtype).
+- `files` and `hashes` keys must match exactly.
+- Files declared in `files` must all be present in the archive.
+- No extra files may appear in the archive beyond those declared.
+- SHA-256 hashes are verified for every declared file.
+
+---
+
+## Replay (`replay/`)
+
+Replay is deliberately separated from capture:
+
+1. The package must contain `replay.json` with `{"replayable": true, …}`.
+2. The package must have integrity hashes, including a hash for `replay.json`.
+3. The user must authorize execution explicitly (`--allow-code-execution`).
+4. The module and callable are imported.
+5. Arguments are reconstructed by the serializer.
+6. The function is called.
+
+If any argument was redacted, truncated, exceeded depth, contained a circular reference, or was unresolvable, `replay.json` is written as `{"replayable": false, "reason": "…"}` and the runner raises `ReplayError` without importing any module.
+
+Replay is assisted reproduction, not a sandbox.
+
+---
+
+## Compatibility
+
+The initial release requires Python 3.11+ for `ExceptionGroup` support and modern typing syntax. The runtime core does not depend on `tomllib` or any third-party package.

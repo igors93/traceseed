@@ -1,57 +1,67 @@
 # TraceSeed
 
-**Transforme falhas Python em pacotes diagnósticos verificáveis e, quando possível, reproduzíveis.**
+**Turn Python failures into verifiable, reproducible diagnostic packages.**
 
-TraceSeed é uma biblioteca modular com **zero dependências em runtime**. Ela captura uma exceção, coleta o contexto útil, remove informações sensíveis, gera uma fingerprint estável e salva um pacote `.tseed` com hashes de integridade.
+TraceSeed is a modular library with **zero runtime dependencies**. It captures an exception, collects useful context, removes sensitive information, generates a stable fingerprint, and saves a `.tseed` package with integrity hashes.
 
-> Estado: versão inicial `0.1.0`, pronta para estudo, evolução e uso controlado. O replay é assistido e deve ser usado somente com pacotes confiáveis.
+> **Status:** initial release `0.1.0`, ready for study, controlled use, and further development. Replay is assisted and should only be used with trusted packages.
 
-## Principais recursos
+---
 
-- API pequena: `@capture`, `guard()` e `capture_exception()`.
-- Funções síncronas e assíncronas.
-- Exceções encadeadas, notas e `ExceptionGroup`.
-- Argumentos, locals opcionais, traceback, runtime, threads e breadcrumbs.
-- Sanitização por nome de campo, regex e função personalizada.
-- Fingerprint que normaliza IDs, números, UUIDs, tokens longos e endereços hexadecimais.
-- Pacotes `.tseed` em ZIP com manifesto e SHA-256.
-- Escrita atômica para evitar pacotes incompletos.
-- Storages em arquivo, diretório e memória.
-- Coletores e serializers extensíveis.
-- CLI para visualizar, verificar, listar, comparar e reproduzir.
-- Hooks para `sys`, `threading` e `asyncio`.
-- Mais de 200 testes de regressão, lint e tipagem estática.
+## Features
 
-## Requisitos
+- **Small API:** `@capture`, `guard()`, and `capture_exception()`.
+- Synchronous and asynchronous support.
+- Chained exceptions, notes, and `ExceptionGroup`.
+- Arguments, locals, traceback, runtime info, threads, and breadcrumbs.
+- Deep sanitization by field name, regex, and custom function.
+- Stable fingerprinting that normalizes IDs, numbers, UUIDs, long tokens, and hex addresses.
+- `.tseed` packages in ZIP format with a manifest and SHA-256 hashes.
+- Atomic writes to prevent incomplete packages.
+- File, directory, and in-memory storage backends.
+- Extensible collectors and serializers.
+- CLI for viewing, verifying, listing, comparing, and replaying packages.
+- Global hooks for `sys`, `threading`, and `asyncio`.
+- Over 330 regression tests, with lint and static type checking.
 
-- Python 3.11 ou superior.
-- Nenhuma dependência externa em runtime.
+---
 
-## Uso direto, sem instalação
+## Requirements
 
-Na raiz do projeto:
+- Python 3.11 or higher.
+- No external runtime dependencies.
+
+---
+
+## Quick start (no install)
+
+From the project root:
 
 ```bash
 PYTHONPATH=src python examples/basic.py
 PYTHONPATH=src python -m traceseed --version
 ```
 
-No Windows PowerShell:
+On Windows PowerShell:
 
 ```powershell
 $env:PYTHONPATH = "src"
 python examples/basic.py
 ```
 
-## Instalação
+---
+
+## Installation
 
 ```bash
 python -m pip install .
 ```
 
-A biblioteca não declara dependências de runtime.
+No runtime dependencies are declared.
 
-## Primeiro exemplo
+---
+
+## Basic example
 
 ```python
 from traceseed import capture
@@ -65,14 +75,16 @@ def process_payment(order_id: int, token: str) -> None:
 process_payment(123, token="secret-token")
 ```
 
-O erro original continua sendo lançado e um pacote será criado em `.traceseeds/`:
+The original exception is re-raised. A package is created under `.traceseeds/`:
 
 ```text
 .traceseeds/
 └── process-payment-traceseed-9c41...-2ac39f10.tseed
 ```
 
-O token é removido antes da persistência.
+The token is redacted before persistence.
+
+---
 
 ## Context manager
 
@@ -83,7 +95,9 @@ with guard("import-customers", metadata={"file": "customers.csv"}):
     import_customers()
 ```
 
-## Captura manual
+---
+
+## Manual capture
 
 ```python
 from traceseed import capture_exception
@@ -99,9 +113,11 @@ except Exception as error:
     raise
 ```
 
-Por padrão, uma falha interna do TraceSeed não substitui a exceção original. Em testes ou ferramentas administrativas, use `strict=True` para receber erros de captura.
+By default, an internal TraceSeed failure never replaces the original exception. Use `strict=True` in tests or admin tools to surface capture errors explicitly.
 
-## Configuração
+---
+
+## Configuration
 
 ```python
 from pathlib import Path
@@ -112,14 +128,31 @@ configure(
         output_directory=Path("var/traceseeds"),
         capture_arguments=True,
         capture_locals=True,
+        capture_argv=False,        # disabled by default — argv may contain secrets
         capture_threads=False,
         max_depth=6,
         max_collection_items=80,
+        max_operation_length=256,
+        max_exception_depth=20,
+        max_exception_children=32,
     ).with_redact_fields({"cpf", "session_id"})
 )
 ```
 
-## Contexto e breadcrumbs
+### Security-relevant defaults
+
+| Field | Default | Notes |
+|---|---|---|
+| `capture_argv` | `False` | `sys.argv` may contain secrets; opt in explicitly |
+| `capture_cwd` | `True` | working directory is low-risk; disable if needed |
+| `max_exception_depth` | `20` | limits chained-exception recursion |
+| `max_exception_children` | `32` | limits `ExceptionGroup` children |
+| `max_operation_length` | `256` | operation name is truncated to this length |
+| `max_replay_payload_size` | `1 MB` | replay payloads larger than this are rejected |
+
+---
+
+## Context and breadcrumbs
 
 ```python
 from traceseed import breadcrumb, context
@@ -130,9 +163,11 @@ with context(request_id="req-123", tenant="company-a"):
     process_payment()
 ```
 
-O contexto usa `contextvars`, portanto permanece isolado entre tasks assíncronas.
+Context uses `contextvars` and stays isolated across async tasks.
 
-## Logs como breadcrumbs
+---
+
+## Logs as breadcrumbs
 
 ```python
 import logging
@@ -142,7 +177,9 @@ handler = BreadcrumbHandler()
 logging.getLogger().addHandler(handler)
 ```
 
-## Storages
+---
+
+## Storage backends
 
 ```python
 from traceseed import TraceSeedConfig
@@ -152,12 +189,12 @@ from traceseed.storage import ArchiveStorage, DirectoryStorage, MemoryStorage
 config = TraceSeedConfig()
 serializer = SafeSerializer(config)
 
-archive = ArchiveStorage(config, serializer)
-directory = DirectoryStorage(config, serializer)
-memory = MemoryStorage()
+archive = ArchiveStorage(config, serializer)   # .tseed ZIP files
+directory = DirectoryStorage(config, serializer)  # unpacked directory
+memory = MemoryStorage()                       # in-memory, useful in tests
 ```
 
-O storage pode ser informado por captura:
+Pass a storage per capture:
 
 ```python
 @capture(storage=memory)
@@ -165,7 +202,7 @@ def operation():
     ...
 ```
 
-Um storage customizado precisa implementar:
+A custom storage only needs to implement:
 
 ```python
 class MyStorage:
@@ -175,7 +212,9 @@ class MyStorage:
         ...
 ```
 
-## Coletores customizados
+---
+
+## Custom collectors
 
 ```python
 from traceseed import register_collector
@@ -191,9 +230,11 @@ class TenantCollector:
 register_collector(TenantCollector())
 ```
 
-Coletores defeituosos são registrados em `collector_errors` e não impedem os outros coletores.
+A failing collector is recorded in `collector_errors` and does not block the others.
 
-## Replay assistido
+---
+
+## Assisted replay
 
 ```python
 @capture(operation="calculate-tax", replayable=True)
@@ -201,13 +242,15 @@ def calculate_tax(amount, rate):
     return amount * rate
 ```
 
-O replay só é gerado quando o callable é importável e todos os argumentos são reconstruíveis.
+Replay is generated only when the callable is importable and all arguments are reconstructable. If any argument was redacted or could not be serialized, `replay.json` contains `{"replayable": false}` and the runner refuses to execute.
 
 ```bash
 traceseed replay failure.tseed --allow-code-execution
 ```
 
-**Atenção:** replay importa módulos e executa código da aplicação. Nunca reproduza um pacote recebido de fonte não confiável.
+> **Warning:** replay imports modules and executes application code. Never replay a package received from an untrusted source.
+
+---
 
 ## CLI
 
@@ -220,15 +263,17 @@ traceseed compare first.tseed second.tseed
 traceseed replay error.tseed --allow-code-execution
 ```
 
-Sem instalação:
+Without installation:
 
 ```bash
 PYTHONPATH=src python -m traceseed show error.tseed
 ```
 
-## Desenvolvimento
+---
 
-TraceSeed possui **zero dependências em runtime**. Para desenvolvimento, testes, lint e tipagem, o projeto utiliza pytest, Ruff e mypy.
+## Development
+
+TraceSeed has **zero runtime dependencies**. Development, testing, linting, and type checking use pytest, Ruff, and mypy.
 
 ```bash
 python -m ruff format --check .
@@ -237,39 +282,45 @@ python -m mypy src
 python -m pytest
 ```
 
-A suíte cobre mais de 200 cenários, incluindo corrupção de pacotes, proteção contra ZIP bomb, ciclos em exceções, `repr()` defeituoso, concorrência assíncrona, hooks globais, falhas dos coletores e reprodução.
+The test suite covers over 330 scenarios, including package corruption, ZIP bomb protection, exception cycles, broken `repr()`, async concurrency, global hooks, collector failures, and replay.
 
-## Estrutura
+---
+
+## Project layout
 
 ```text
 src/traceseed/
-├── api.py              API pública e hooks
-├── engine.py           orquestração da captura
-├── config.py           configuração imutável
-├── context.py          contexto e breadcrumbs
-├── fingerprint.py      agrupamento estável
-├── redaction.py        remoção de segredos
-├── serialization.py    codec JSON seguro
-├── collectors/         coletores independentes
-├── storage/            arquivo, diretório e memória
-├── replay/             reprodução assistida
-└── cli.py              comandos administrativos
+├── api.py              public API and hooks
+├── engine.py           capture orchestration
+├── config.py           immutable configuration
+├── context.py          context and breadcrumbs
+├── fingerprint.py      stable failure grouping
+├── redaction.py        secret removal
+├── serialization.py    safe JSON codec
+├── collectors/         independent data collectors
+├── storage/            file, directory, and memory backends
+├── replay/             assisted reproduction
+└── cli.py              administrative commands
 ```
 
-Leia também:
+See also:
 
-- `docs/ARCHITECTURE.md`
-- `docs/SECURITY.md`
-- `docs/EXTENDING.md`
-- `CONTRIBUTING.md`
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/SECURITY.md](docs/SECURITY.md)
+- [docs/EXTENDING.md](docs/EXTENDING.md)
+- [CONTRIBUTING.md](CONTRIBUTING.md)
 
-## Limites conhecidos
+---
 
-- Replay não recria automaticamente bancos de dados, rede, arquivos externos ou estado global.
-- Objetos arbitrários são representados para diagnóstico, mas não são reconstruídos automaticamente.
-- O isolamento do replay não é um sandbox de segurança.
-- Capturar locals pode registrar dados sensíveis; mantenha sanitização e limites adequados.
+## Known limitations
 
-## Licença
+- Replay does not automatically recreate databases, network, external files, or global state.
+- Arbitrary objects are represented for diagnostic purposes but are not automatically reconstructed.
+- Replay isolation is not a security sandbox.
+- Capturing locals may record sensitive data — maintain proper sanitization and limits.
+
+---
+
+## License
 
 MIT.
